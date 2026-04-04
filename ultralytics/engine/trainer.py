@@ -333,7 +333,7 @@ class BaseTrainer:
         self.validator = self.get_validator()
         self.ema = ModelEMA(self.model)
         if RANK in {-1, 0}:
-            metric_keys = self.validator.metrics.keys + self.label_loss_items(prefix="val")
+            metric_keys = [*self.validator.metrics.keys, *self.label_loss_items(prefix="val"), *self.model_metrics()]
             self.metrics = dict(zip(metric_keys, [0] * len(metric_keys)))
             if self.args.plots:
                 self.plot_training_labels()
@@ -704,6 +704,7 @@ class BaseTrainer:
         metrics = self.validator(self)
         if metrics is None:
             return None, None
+        metrics = {**metrics, **self.model_metrics()}
         fitness = metrics.pop("fitness", -self.loss.detach().cpu().numpy())  # use loss as fitness measure if not found
         if not self.best_fitness or self.best_fitness < fitness:
             self.best_fitness = fitness
@@ -732,6 +733,10 @@ class BaseTrainer:
             This is not needed for classification but necessary for segmentation & detection
         """
         return {"loss": loss_items} if loss_items is not None else ["loss"]
+
+    def model_metrics(self):
+        """Return additional scalar metrics associated with the model."""
+        return {}
 
     def set_model_attributes(self):
         """Set or update model parameters before training."""

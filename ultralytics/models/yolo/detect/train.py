@@ -14,6 +14,7 @@ import torch.nn as nn
 from ultralytics.data import build_dataloader, build_yolo_dataset
 from ultralytics.engine.trainer import BaseTrainer
 from ultralytics.models import yolo
+from ultralytics.nn.modules import ResidualLDCM
 from ultralytics.nn.tasks import DetectionModel
 from ultralytics.utils import DEFAULT_CFG, LOGGER, RANK
 from ultralytics.utils.patches import override_configs
@@ -183,6 +184,22 @@ class DetectionTrainer(BaseTrainer):
             return dict(zip(keys, loss_items))
         else:
             return keys
+
+    def model_metrics(self) -> dict[str, float]:
+        """Return learnable residual scaling metrics for ResidualLDCM modules."""
+        if not isinstance(self.model, nn.Module):
+            return {}
+
+        alphas = [
+            round(float(m.alpha.detach().float().cpu().item()), 6)
+            for m in unwrap_model(self.model).modules()
+            if isinstance(m, ResidualLDCM)
+        ]
+        if not alphas:
+            return {}
+        if len(alphas) == 1:
+            return {"alpha/residual_ldcm": alphas[0]}
+        return {f"alpha/residual_ldcm_{i}": alpha for i, alpha in enumerate(alphas)}
 
     def progress_string(self):
         """Return a formatted string of training progress with epoch, GPU memory, loss, instances and size."""

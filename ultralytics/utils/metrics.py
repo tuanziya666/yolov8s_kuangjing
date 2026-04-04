@@ -84,6 +84,8 @@ def bbox_iou(
     GIoU: bool = False,
     DIoU: bool = False,
     CIoU: bool = False,
+    InnerIoU: bool = False,
+    inner_ratio: float = 0.8,
     eps: float = 1e-7,
 ) -> torch.Tensor:
     """Calculate the Intersection over Union (IoU) between bounding boxes.
@@ -100,6 +102,8 @@ def bbox_iou(
         GIoU (bool, optional): If True, calculate Generalized IoU.
         DIoU (bool, optional): If True, calculate Distance IoU.
         CIoU (bool, optional): If True, calculate Complete IoU.
+        InnerIoU (bool, optional): If True, calculate IoU on ratio-scaled inner boxes.
+        inner_ratio (float, optional): Inner-box scaling ratio used by Inner-IoU.
         eps (float, optional): A small value to avoid division by zero.
 
     Returns:
@@ -127,6 +131,21 @@ def bbox_iou(
 
     # IoU
     iou = inter / union
+    if InnerIoU:
+        inner_ratio = max(float(inner_ratio), eps)
+        b1_cx, b1_cy = (b1_x1 + b1_x2) / 2, (b1_y1 + b1_y2) / 2
+        b2_cx, b2_cy = (b2_x1 + b2_x2) / 2, (b2_y1 + b2_y2) / 2
+        inner_w1, inner_h1 = w1 * inner_ratio, h1 * inner_ratio
+        inner_w2, inner_h2 = w2 * inner_ratio, h2 * inner_ratio
+        inner_b1_x1, inner_b1_x2 = b1_cx - inner_w1 / 2, b1_cx + inner_w1 / 2
+        inner_b1_y1, inner_b1_y2 = b1_cy - inner_h1 / 2, b1_cy + inner_h1 / 2
+        inner_b2_x1, inner_b2_x2 = b2_cx - inner_w2 / 2, b2_cx + inner_w2 / 2
+        inner_b2_y1, inner_b2_y2 = b2_cy - inner_h2 / 2, b2_cy + inner_h2 / 2
+        inner_inter = (inner_b1_x2.minimum(inner_b2_x2) - inner_b1_x1.maximum(inner_b2_x1)).clamp_(0) * (
+            inner_b1_y2.minimum(inner_b2_y2) - inner_b1_y1.maximum(inner_b2_y1)
+        ).clamp_(0)
+        inner_union = inner_w1 * inner_h1 + inner_w2 * inner_h2 - inner_inter + eps
+        return inner_inter / inner_union
     if CIoU or DIoU or GIoU:
         cw = b1_x2.maximum(b2_x2) - b1_x1.minimum(b2_x1)  # convex (smallest enclosing box) width
         ch = b1_y2.maximum(b2_y2) - b1_y1.minimum(b2_y1)  # convex height

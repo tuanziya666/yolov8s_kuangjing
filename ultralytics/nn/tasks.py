@@ -54,6 +54,7 @@ from ultralytics.nn.modules import (
     ImagePoolingAttn,
     Index,
     LDCM,
+    ResidualLDCM,
     LRPCHead,
     Pose,
     RepC3,
@@ -1555,6 +1556,7 @@ def parse_model(d, ch, verbose=True):
             C2fCIB,
             A2C2f,
             LDCM,
+            ResidualLDCM,
         }
     )
     repeat_modules = frozenset(  # modules with 'repeat' arguments

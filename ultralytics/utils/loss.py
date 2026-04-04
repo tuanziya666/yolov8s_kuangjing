@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ultralytics.utils import LOGGER
 from ultralytics.utils.metrics import OKS_SIGMA
 from ultralytics.utils.ops import crop_mask, xywh2xyxy, xyxy2xywh
 from ultralytics.utils.tal import RotatedTaskAlignedAssigner, TaskAlignedAssigner, dist2bbox, dist2rbox, make_anchors
@@ -15,6 +17,20 @@ from ultralytics.utils.torch_utils import autocast
 
 from .metrics import bbox_iou, probiou
 from .tal import bbox2dist
+
+
+def _env_str(name: str, default: str) -> str:
+    """Read a lowercase string hyperparameter from the environment."""
+    value = os.getenv(name, default)
+    return default if value is None else str(value).strip().lower()
+
+
+def _env_float(name: str, default: float) -> float:
+    """Read a float hyperparameter from the environment."""
+    try:
+        return float(os.getenv(name, default))
+    except (TypeError, ValueError):
+        return default
 
 
 class VarifocalLoss(nn.Module):
@@ -84,6 +100,43 @@ class FocalLoss(nn.Module):
         return loss.mean(1).sum()
 
 
+class AdaptiveThresholdFocalLoss(nn.Module):
+    """Adaptive Threshold Focal Loss (ATFL) from EFLNet."""
+
+    def __init__(self, loss_fcn: nn.Module, eps: float = 1e-7):
+        """Wrap a BCE-style loss and apply adaptive threshold modulation elementwise."""
+        super().__init__()
+        self.loss_fcn = loss_fcn
+        self.reduction = loss_fcn.reduction
+        self.loss_fcn.reduction = "none"
+        self.eps = eps
+
+    def forward(self, pred: torch.Tensor, true: torch.Tensor) -> torch.Tensor:
+        """Compute ATFL with different modulation on the two sides of the 0.5 threshold."""
+        with autocast(enabled=False):
+            pred = pred.float()
+            true = true.float()
+            loss = self.loss_fcn(pred, true)
+            pred_prob = pred.sigmoid()
+            p_t = true * pred_prob + (1 - true) * (1 - pred_prob)
+            mean_pt = p_t.mean().clamp_(self.eps, 1.0)
+            gamma_high = -mean_pt.log()
+            gamma_low = -p_t.clamp_min(self.eps).log()
+
+            modulating_factor = torch.zeros_like(p_t)
+            high_mask = p_t > 0.5
+            low_mask = ~high_mask
+            modulating_factor[high_mask] = (1.000001 - p_t[high_mask]).pow(gamma_high)
+            modulating_factor[low_mask] = (1.5 - p_t[low_mask]).pow(gamma_low[low_mask])
+            loss = loss * modulating_factor
+
+        if self.reduction == "mean":
+            return loss.mean()
+        if self.reduction == "sum":
+            return loss.sum()
+        return loss
+
+
 class DFLoss(nn.Module):
     """Criterion class for computing Distribution Focal Loss (DFL)."""
 
@@ -112,6 +165,8 @@ class BboxLoss(nn.Module):
         """Initialize the BboxLoss module with regularization maximum and DFL settings."""
         super().__init__()
         self.dfl_loss = DFLoss(reg_max) if reg_max > 1 else None
+        self.iou_type = _env_str("ULTRALYTICS_IOU_LOSS", "ciou")
+        self.inner_iou_ratio = _env_float("ULTRALYTICS_INNER_IOU_RATIO", 0.8)
 
     def forward(
         self,
@@ -125,7 +180,21 @@ class BboxLoss(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute IoU and DFL losses for bounding boxes."""
         weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
-        iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
+        if self.iou_type == "inner_iou":
+            iou = bbox_iou(
+                pred_bboxes[fg_mask],
+                target_bboxes[fg_mask],
+                xywh=False,
+                InnerIoU=True,
+                inner_ratio=self.inner_iou_ratio,
+            )
+        else:
+            if self.iou_type != "ciou":
+                LOGGER.warning(
+                    f"Unknown ULTRALYTICS_IOU_LOSS='{self.iou_type}', falling back to CIoU regression loss."
+                )
+                self.iou_type = "ciou"
+            iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
         loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
 
         # DFL loss
@@ -213,6 +282,16 @@ class v8DetectionLoss:
         self.assigner = TaskAlignedAssigner(topk=tal_topk, num_classes=self.nc, alpha=0.5, beta=6.0)
         self.bbox_loss = BboxLoss(m.reg_max).to(device)
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
+        self.cls_loss_type = _env_str("ULTRALYTICS_CLS_LOSS", "bce")
+        if self.cls_loss_type == "atfl":
+            self.cls_loss_fcn = AdaptiveThresholdFocalLoss(self.bce)
+            LOGGER.info("Using Adaptive Threshold Focal Loss (ATFL) for detection classification loss.")
+        else:
+            if self.cls_loss_type != "bce":
+                LOGGER.warning(
+                    f"Unknown ULTRALYTICS_CLS_LOSS='{self.cls_loss_type}', falling back to BCE classification loss."
+                )
+            self.cls_loss_fcn = self.bce
 
     def preprocess(self, targets: torch.Tensor, batch_size: int, scale_tensor: torch.Tensor) -> torch.Tensor:
         """Preprocess targets by converting to tensor format and scaling coordinates."""
@@ -281,7 +360,7 @@ class v8DetectionLoss:
 
         # Cls loss
         # loss[1] = self.varifocal_loss(pred_scores, target_scores, target_labels) / target_scores_sum  # VFL way
-        loss[1] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
+        loss[1] = self.cls_loss_fcn(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum
 
         # Bbox loss
         if fg_mask.sum():
@@ -360,7 +439,7 @@ class v8SegmentationLoss(v8DetectionLoss):
 
         # Cls loss
         # loss[1] = self.varifocal_loss(pred_scores, target_scores, target_labels) / target_scores_sum  # VFL way
-        loss[2] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
+        loss[2] = self.cls_loss_fcn(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum
 
         if fg_mask.sum():
             # Bbox loss
@@ -538,7 +617,7 @@ class v8PoseLoss(v8DetectionLoss):
 
         # Cls loss
         # loss[1] = self.varifocal_loss(pred_scores, target_scores, target_labels) / target_scores_sum  # VFL way
-        loss[3] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
+        loss[3] = self.cls_loss_fcn(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum
 
         # Bbox loss
         if fg_mask.sum():
@@ -735,7 +814,7 @@ class v8OBBLoss(v8DetectionLoss):
 
         # Cls loss
         # loss[1] = self.varifocal_loss(pred_scores, target_scores, target_labels) / target_scores_sum  # VFL way
-        loss[1] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
+        loss[1] = self.cls_loss_fcn(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum
 
         # Bbox loss
         if fg_mask.sum():

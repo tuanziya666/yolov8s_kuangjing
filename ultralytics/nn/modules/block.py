@@ -46,6 +46,7 @@ __all__ = (
     "HGStem",
     "ImagePoolingAttn",
     "LDCM",
+    "ResidualLDCM",
     "Proto",
     "RepC3",
     "RepNCSPELAN4",
@@ -500,14 +501,39 @@ class LDCM(nn.Module):
         self.cv2 = Conv(cm * 3, c2, 1, 1)
         self.add = c1 == c2
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass for the LDCM module."""
+    def forward_features(self, x: torch.Tensor) -> torch.Tensor:
+        """Extract local, directional, and contextual features."""
         y = self.cv1(x)
         y_local = self.local(y)
         y_direction = self.dir_fuse(self.dir_h(y) + self.dir_v(y))
         y_context = y * self.context(y)
-        out = self.cv2(torch.cat((y_local, y_direction, y_context), 1))
+        return self.cv2(torch.cat((y_local, y_direction, y_context), 1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass for the LDCM module."""
+        out = self.forward_features(x)
         return out + x if self.add else out
+
+
+class ResidualLDCM(LDCM):
+    """Residual LDCM with learnable residual scaling."""
+
+    def __init__(self, c1: int, c2: int | None = None, alpha_init: float = 0.1, e: float = 0.5):
+        """Initialize the ResidualLDCM module.
+
+        Args:
+            c1 (int): Input channels.
+            c2 (int, optional): Output channels. Defaults to ``c1``.
+            alpha_init (float): Initial value for the learnable residual scaling factor.
+            e (float): Channel reduction ratio used to compute the hidden channels.
+        """
+        super().__init__(c1, c2, e)
+        self.alpha = nn.Parameter(torch.tensor(float(alpha_init)))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply learnable residual scaling when input and output shapes match."""
+        out = self.forward_features(x)
+        return x + self.alpha * out if self.add else out
 
 
 class BottleneckCSP(nn.Module):
