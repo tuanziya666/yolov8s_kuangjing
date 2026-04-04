@@ -10,7 +10,6 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -19,12 +18,10 @@ if str(ROOT) not in sys.path:
 def _rewrite_resume_path_args(argv: list[str]) -> list[str]:
     """Rewrite ``resume=<ckpt>`` into ``model=<ckpt> resume=True`` when needed.
 
-    Ultralytics 8.3.248 expects resume runs to be started as
-    ``model=path/to/last.pt resume=True``. Passing ``resume=path/to/last.pt``
-    directly can be overwritten by the default model resolution logic, so this
-    wrapper normalizes that shorthand into the form the trainer actually uses.
+    Ultralytics 8.3.248 expects resume runs to be started as ``model=path/to/last.pt resume=True``. Passing
+    ``resume=path/to/last.pt`` directly can be overwritten by the default model resolution logic, so this wrapper
+    normalizes that shorthand into the form the trainer actually uses.
     """
-
     args = list(argv)
     resume_idx = next((i for i, arg in enumerate(args) if arg.startswith("resume=")), None)
     if resume_idx is None:
