@@ -826,7 +826,16 @@ def check_amp(model):
         del m
         return a.shape == b.shape and torch.allclose(a, b.float(), atol=0.5)  # close to 0.5 absolute tolerance
 
-    im = ASSETS / "bus.jpg"  # image to check
+    def ensure_amp_check_image(path):
+        """Ensure the AMP validation image exists and is a readable image file."""
+        if cv2.imread(str(path)) is None:
+            path.unlink(missing_ok=True)
+            downloads.safe_download(url=f"{ASSETS_URL}/bus.jpg", file=path, unzip=False, min_bytes=1024, retry=3)
+            if cv2.imread(str(path)) is None:
+                raise FileNotFoundError(f"AMP check image '{path}' is not a valid image file.")
+        return path
+
+    im = ensure_amp_check_image(ASSETS / "bus.jpg")  # image to check
     LOGGER.info(f"{prefix}running Automatic Mixed Precision (AMP) checks...")
     warning_msg = "Setting 'amp=True'. If you experience zero-mAP or NaN losses you can disable AMP with amp=False."
     try:
