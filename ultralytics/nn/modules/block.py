@@ -45,6 +45,7 @@ __all__ = (
     "HGBlock",
     "HGStem",
     "ImagePoolingAttn",
+    "LSKA",
     "LDCM",
     "ResidualLDCM",
     "Proto",
@@ -476,6 +477,47 @@ class Bottleneck(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply bottleneck with optional shortcut connection."""
         return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
+
+
+class LSKA(nn.Module):
+    """Large Separable Kernel Attention block."""
+
+    def __init__(self, c1: int, c2: int | None = None, k_size: int = 11, dilation: int = 2):
+        """Initialize the LSKA block.
+
+        Args:
+            c1 (int): Input channels.
+            c2 (int, optional): Output channels. Defaults to ``c1``.
+            k_size (int): Effective large kernel size used by the attention branch.
+            dilation (int): Dilation applied to the separable spatial convolutions.
+        """
+        super().__init__()
+        c2 = c1 if c2 is None else c2
+        self.cv = Conv(c1, c2, 1, 1, act=False) if c1 != c2 else nn.Identity()
+
+        ks_dw = 2 * dilation - 1
+        ks_dilated = max(k_size // dilation, 1)
+        pad_dw = (ks_dw - 1) // 2
+        pad_dilated = dilation * (ks_dilated - 1) // 2
+
+        self.conv0_h = nn.Conv2d(c2, c2, kernel_size=(1, ks_dw), padding=(0, pad_dw), groups=c2)
+        self.conv0_v = nn.Conv2d(c2, c2, kernel_size=(ks_dw, 1), padding=(pad_dw, 0), groups=c2)
+        self.conv_spatial_h = nn.Conv2d(
+            c2, c2, kernel_size=(1, ks_dilated), padding=(0, pad_dilated), groups=c2, dilation=dilation
+        )
+        self.conv_spatial_v = nn.Conv2d(
+            c2, c2, kernel_size=(ks_dilated, 1), padding=(pad_dilated, 0), groups=c2, dilation=dilation
+        )
+        self.conv1 = nn.Conv2d(c2, c2, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply large separable kernel attention to the input tensor."""
+        y = self.cv(x)
+        attn = self.conv0_h(y)
+        attn = self.conv0_v(attn)
+        attn = self.conv_spatial_h(attn)
+        attn = self.conv_spatial_v(attn)
+        return y * self.conv1(attn)
 
 
 class LDCM(nn.Module):

@@ -53,6 +53,7 @@ from ultralytics.nn.modules import (
     HGStem,
     ImagePoolingAttn,
     Index,
+    LSKA,
     LDCM,
     ResidualLDCM,
     LRPCHead,
@@ -1555,6 +1556,7 @@ def parse_model(d, ch, verbose=True):
             SCDown,
             C2fCIB,
             A2C2f,
+            LSKA,
             LDCM,
             ResidualLDCM,
         }
