@@ -45,9 +45,16 @@ __all__ = (
     "HGBlock",
     "HGStem",
     "ImagePoolingAttn",
+    "ASFF2",
+    "CARAFE",
+    "CSPStage",
+    "C2fDCNv3",
+    "CoordAtt",
+    "AFPN",
     "LSKA",
     "LDCM",
     "ResidualLDCM",
+    "StripPooling",
     "Proto",
     "RepC3",
     "RepNCSPELAN4",
@@ -518,6 +525,324 @@ class LSKA(nn.Module):
         attn = self.conv_spatial_h(attn)
         attn = self.conv_spatial_v(attn)
         return y * self.conv1(attn)
+
+
+class ASFF2(nn.Module):
+    """Adaptive spatial feature fusion for two aligned inputs."""
+
+    def __init__(self, c1: list[int] | tuple[int, int], c2: int):
+        """Initialize two-branch ASFF.
+
+        Args:
+            c1 (list[int] | tuple[int, int]): Input channels for the two branches.
+            c2 (int): Output channels after fusion.
+        """
+        super().__init__()
+        if len(c1) != 2:
+            raise ValueError("ASFF2 expects exactly two input branches.")
+
+        compress_c = max(min(c2 // 8, 32), 8)
+        self.cv = nn.ModuleList(Conv(ci, c2, 1, 1) for ci in c1)
+        self.weight_level_1 = Conv(c2, compress_c, 1, 1)
+        self.weight_level_2 = Conv(c2, compress_c, 1, 1)
+        self.weight_levels = nn.Conv2d(compress_c * 2, 2, kernel_size=1, stride=1, padding=0)
+        self.conv = Conv(c2, c2, 3, 1)
+
+    def forward(self, x: list[torch.Tensor] | tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+        """Fuse two aligned feature maps with learned spatial weights."""
+        if len(x) != 2:
+            raise ValueError(f"ASFF2 expected 2 inputs, but got {len(x)}.")
+
+        x1, x2 = (cv(xi) for cv, xi in zip(self.cv, x))
+        level_1_weight_v = self.weight_level_1(x1)
+        level_2_weight_v = self.weight_level_2(x2)
+        levels_weight = self.weight_levels(torch.cat((level_1_weight_v, level_2_weight_v), 1)).softmax(1)
+        fused = x1 * levels_weight[:, 0:1] + x2 * levels_weight[:, 1:2]
+        return self.conv(fused)
+
+
+class CARAFE(nn.Module):
+    """Content-aware upsampling module."""
+
+    def __init__(self, c1: int, c2: int | None = None, k_enc: int = 3, k_up: int = 5, c_mid: int = 64, scale: int = 2):
+        """Initialize CARAFE.
+
+        Args:
+            c1 (int): Input channels.
+            c2 (int, optional): Output channels. Defaults to ``c1``.
+            k_enc (int): Kernel size of the reassembly kernel encoder.
+            k_up (int): Kernel size of the content-aware reassembly window.
+            c_mid (int): Compressed channels used by the encoder.
+            scale (int): Upsampling scale factor.
+        """
+        super().__init__()
+        c2 = c1 if c2 is None else c2
+        self.scale = scale
+        self.align = Conv(c1, c2, 1, 1) if c1 != c2 else nn.Identity()
+        self.comp = Conv(c2, c_mid, 1, 1)
+        self.enc = Conv(c_mid, (scale * k_up) ** 2, k=k_enc, act=False)
+        self.pix_shf = nn.PixelShuffle(scale)
+        self.upsmp = nn.Upsample(scale_factor=scale, mode="nearest")
+        self.unfold = nn.Unfold(kernel_size=k_up, dilation=scale, padding=k_up // 2 * scale)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Upsample the feature map with content-aware reassembly."""
+        x = self.align(x)
+        b, c, h, w = x.size()
+        h_, w_ = h * self.scale, w * self.scale
+
+        w_kernel = self.comp(x)
+        w_kernel = self.enc(w_kernel)
+        w_kernel = self.pix_shf(w_kernel).softmax(dim=1)
+
+        x = self.upsmp(x)
+        x = self.unfold(x).view(b, c, -1, h_, w_)
+        return torch.einsum("bkhw,bckhw->bchw", [w_kernel, x])
+
+
+class h_sigmoid(nn.Module):
+    """Hard sigmoid helper used by coordinate attention."""
+
+    def __init__(self, inplace: bool = True):
+        super().__init__()
+        self.relu = nn.ReLU6(inplace=inplace)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply hard sigmoid."""
+        return self.relu(x + 3) / 6
+
+
+class h_swish(nn.Module):
+    """Hard swish helper used by coordinate attention."""
+
+    def __init__(self, inplace: bool = True):
+        super().__init__()
+        self.sigmoid = h_sigmoid(inplace=inplace)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply hard swish."""
+        return x * self.sigmoid(x)
+
+
+class CoordAtt(nn.Module):
+    """Coordinate attention block."""
+
+    def __init__(self, c1: int, c2: int | None = None, reduction: int = 32):
+        """Initialize coordinate attention.
+
+        Args:
+            c1 (int): Input channels.
+            c2 (int, optional): Output channels. Defaults to ``c1``.
+            reduction (int): Channel reduction ratio.
+        """
+        super().__init__()
+        c2 = c1 if c2 is None else c2
+        self.align = Conv(c1, c2, 1, 1, act=False) if c1 != c2 else nn.Identity()
+        self.pool_h = nn.AdaptiveAvgPool2d((None, 1))
+        self.pool_w = nn.AdaptiveAvgPool2d((1, None))
+        mip = max(8, c2 // reduction)
+        self.conv1 = nn.Conv2d(c2, mip, kernel_size=1, stride=1, padding=0)
+        self.bn1 = nn.BatchNorm2d(mip)
+        self.act = h_swish()
+        self.conv_h = nn.Conv2d(mip, c2, kernel_size=1, stride=1, padding=0)
+        self.conv_w = nn.Conv2d(mip, c2, kernel_size=1, stride=1, padding=0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply coordinate attention to the input tensor."""
+        x = self.align(x)
+        identity = x
+        _, _, h, w = x.size()
+        x_h = self.pool_h(x)
+        x_w = self.pool_w(x).permute(0, 1, 3, 2)
+        y = self.act(self.bn1(self.conv1(torch.cat([x_h, x_w], dim=2))))
+        x_h, x_w = torch.split(y, [h, w], dim=2)
+        x_w = x_w.permute(0, 1, 3, 2)
+        a_h = self.conv_h(x_h).sigmoid()
+        a_w = self.conv_w(x_w).sigmoid()
+        return identity * a_h * a_w
+
+
+class StripPooling(nn.Module):
+    """Strip pooling block for elongated structures."""
+
+    def __init__(self, c1: int, c2: int | None = None, reduction: int = 4):
+        """Initialize strip pooling.
+
+        Args:
+            c1 (int): Input channels.
+            c2 (int, optional): Output channels. Defaults to ``c1``.
+            reduction (int): Reduction ratio for the intermediate channels.
+        """
+        super().__init__()
+        c2 = c1 if c2 is None else c2
+        inter = max(c2 // reduction, 16)
+        self.align = Conv(c1, c2, 1, 1, act=False) if c1 != c2 else nn.Identity()
+        self.conv1 = Conv(c2, inter, 1, 1)
+        self.pool_h = nn.AdaptiveAvgPool2d((1, None))
+        self.pool_w = nn.AdaptiveAvgPool2d((None, 1))
+        self.conv_h = nn.Conv2d(inter, inter, kernel_size=(1, 3), padding=(0, 1), bias=False)
+        self.conv_w = nn.Conv2d(inter, inter, kernel_size=(3, 1), padding=(1, 0), bias=False)
+        self.bn = nn.BatchNorm2d(inter)
+        self.conv2 = Conv(inter, c2, 1, 1, act=False)
+        self.add = c1 == c2
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Pool along horizontal and vertical strips and fuse the responses."""
+        y = self.align(x)
+        h, w = y.shape[2:]
+        base = self.conv1(y)
+        y_h = F.interpolate(self.conv_h(self.pool_h(base)), size=(h, w), mode="bilinear", align_corners=False)
+        y_w = F.interpolate(self.conv_w(self.pool_w(base)), size=(h, w), mode="bilinear", align_corners=False)
+        out = self.conv2(F.silu(self.bn(y_h + y_w)))
+        return y + out if self.add else out
+
+
+class BasicBlockRepGFPN(nn.Module):
+    """RepGFPN basic block built from RepConv and Conv."""
+
+    def __init__(self, c: int, e: float = 1.0):
+        """Initialize the RepGFPN basic block."""
+        super().__init__()
+        hidden = int(c * e)
+        self.cv1 = RepConv(c, hidden, 3, 1, act=True)
+        self.cv2 = Conv(hidden, c, 3, 1, act=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply RepGFPN residual block."""
+        return F.silu(x + self.cv2(self.cv1(x)))
+
+
+class CSPStage(nn.Module):
+    """Simplified CSP stage used by RepGFPN-style necks."""
+
+    def __init__(self, c1: int, c2: int, n: int = 1, e: float = 1.0):
+        """Initialize CSPStage.
+
+        Args:
+            c1 (int): Input channels.
+            c2 (int): Output channels.
+            n (int): Number of RepGFPN basic blocks.
+            e (float): Expansion ratio inside the basic block.
+        """
+        super().__init__()
+        ch_first = c2 // 2
+        ch_mid = c2 - ch_first
+        self.cv1 = Conv(c1, ch_first, 1, 1)
+        self.cv2 = Conv(c1, ch_mid, 1, 1)
+        self.blocks = nn.ModuleList(BasicBlockRepGFPN(ch_mid, e=e) for _ in range(n))
+        self.cv3 = Conv(ch_first + ch_mid * n, c2, 1, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply CSPStage to the input tensor."""
+        y1 = self.cv1(x)
+        y2 = self.cv2(x)
+        outs = [y1]
+        for block in self.blocks:
+            y2 = block(y2)
+            outs.append(y2)
+        return self.cv3(torch.cat(outs, 1))
+
+
+class DCNv3Conv(nn.Module):
+    """Deformable convolution block used as a light DCNv3-style substitute."""
+
+    def __init__(self, c1: int, c2: int, k: int = 3, s: int = 1, g: int = 1, d: int = 1, act: bool = True):
+        """Initialize the DCNv3-style convolution block."""
+        super().__init__()
+        try:
+            from torchvision.ops import DeformConv2d
+        except Exception as e:  # pragma: no cover - depends on torchvision build
+            raise ImportError("torchvision.ops.DeformConv2d is required for DCNv3 experiments.") from e
+
+        self.align = Conv(c1, c2, 1, 1, act=False) if c1 != c2 else nn.Identity()
+        self.offset_mask = nn.Conv2d(c2, 3 * k * k, kernel_size=k, stride=s, padding=autopad(k, None, d), dilation=d)
+        self.dcn = DeformConv2d(c2, c2, kernel_size=k, stride=s, padding=autopad(k, None, d), dilation=d, groups=g, bias=False)
+        self.bn = nn.BatchNorm2d(c2)
+        self.act = Conv.default_act if act is True else act if isinstance(act, nn.Module) else nn.Identity()
+        nn.init.zeros_(self.offset_mask.weight)
+        nn.init.zeros_(self.offset_mask.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply deformable convolution with learned offsets and modulation mask."""
+        x = self.align(x)
+        offset_mask = self.offset_mask(x)
+        k2 = self.dcn.kernel_size[0] * self.dcn.kernel_size[1]
+        offset, mask = torch.split(offset_mask, [2 * k2, k2], dim=1)
+        x = self.dcn(x, offset, mask.sigmoid())
+        return self.act(self.bn(x))
+
+
+class BottleneckDCNv3(nn.Module):
+    """Bottleneck block with DCNv3-style spatial mixing."""
+
+    def __init__(self, c1: int, c2: int, shortcut: bool = True, g: int = 1, e: float = 1.0):
+        """Initialize DCNv3 bottleneck."""
+        super().__init__()
+        hidden = int(c2 * e)
+        self.cv1 = Conv(c1, hidden, 1, 1)
+        self.cv2 = DCNv3Conv(hidden, c2, 3, 1, g=g)
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply DCNv3 bottleneck with optional residual connection."""
+        out = self.cv2(self.cv1(x))
+        return x + out if self.add else out
+
+
+class C2fDCNv3(nn.Module):
+    """C2f block with DCNv3-style bottlenecks."""
+
+    def __init__(self, c1: int, c2: int, n: int = 1, shortcut: bool = False, g: int = 1, e: float = 0.5):
+        """Initialize C2fDCNv3."""
+        super().__init__()
+        self.c = int(c2 * e)
+        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
+        self.cv2 = Conv((2 + n) * self.c, c2, 1, 1)
+        self.m = nn.ModuleList(BottleneckDCNv3(self.c, self.c, shortcut, g, e=1.0) for _ in range(n))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass through C2fDCNv3."""
+        y = list(self.cv1(x).chunk(2, 1))
+        y.extend(m(y[-1]) for m in self.m)
+        return self.cv2(torch.cat(y, 1))
+
+
+class AFPN(nn.Module):
+    """Adaptive feature fusion block for the feature pyramid neck."""
+
+    def __init__(self, c1: list[int] | tuple[int, ...], c2: int):
+        """Initialize AFPN fusion for same-resolution multi-branch features.
+
+        Args:
+            c1 (list[int] | tuple[int, ...]): Input channels for each branch to be fused.
+            c2 (int): Output channels after adaptive fusion.
+        """
+        super().__init__()
+        if len(c1) < 2:
+            raise ValueError("AFPN expects at least two input branches.")
+
+        hidden = max(c2 // 4, 16)
+        self.cv = nn.ModuleList(Conv(ci, c2, 1, 1) for ci in c1)
+        self.weight = nn.ModuleList(
+            nn.Sequential(
+                nn.Conv2d(c2, hidden, 1, bias=False),
+                nn.BatchNorm2d(hidden),
+                nn.SiLU(),
+                nn.Conv2d(hidden, 1, 1),
+            )
+            for _ in c1
+        )
+        self.project = Conv(c2, c2, 3, 1)
+
+    def forward(self, x: list[torch.Tensor] | tuple[torch.Tensor, ...]) -> torch.Tensor:
+        """Fuse aligned pyramid features with learned spatial weights."""
+        if len(x) != len(self.cv):
+            raise ValueError(f"AFPN expected {len(self.cv)} inputs, but got {len(x)}.")
+
+        y = [cv(xi) for cv, xi in zip(self.cv, x)]
+        w = torch.cat([wi(yi) for wi, yi in zip(self.weight, y)], 1).softmax(1)
+        out = sum(yi * w[:, i : i + 1] for i, yi in enumerate(y))
+        return self.project(out)
 
 
 class LDCM(nn.Module):

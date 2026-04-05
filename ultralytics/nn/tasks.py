@@ -27,22 +27,28 @@ from ultralytics.nn.modules import (
     A2C2f,
     AConv,
     ADown,
+    ASFF2,
+    AFPN,
     Bottleneck,
     BottleneckCSP,
     C2f,
     C2fAttn,
     C2fCIB,
+    C2fDCNv3,
     C2fPSA,
     C3Ghost,
     C3k2,
     C3x,
+    CARAFE,
     CBFuse,
     CBLinear,
+    CSPStage,
     Classify,
     Concat,
     Conv,
     Conv2,
     ConvTranspose,
+    CoordAtt,
     Detect,
     DWConv,
     DWConvTranspose2d,
@@ -66,6 +72,7 @@ from ultralytics.nn.modules import (
     RTDETRDecoder,
     SCDown,
     Segment,
+    StripPooling,
     TorchVision,
     WorldDetect,
     YOLOEDetect,
@@ -1556,9 +1563,14 @@ def parse_model(d, ch, verbose=True):
             SCDown,
             C2fCIB,
             A2C2f,
+            CARAFE,
+            CSPStage,
+            CoordAtt,
             LSKA,
             LDCM,
             ResidualLDCM,
+            StripPooling,
+            C2fDCNv3,
         }
     )
     repeat_modules = frozenset(  # modules with 'repeat' arguments
@@ -1578,6 +1590,8 @@ def parse_model(d, ch, verbose=True):
             C2fCIB,
             C2PSA,
             A2C2f,
+            CSPStage,
+            C2fDCNv3,
         }
     )
     for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"]):  # from, number, module, args
@@ -1627,6 +1641,16 @@ def parse_model(d, ch, verbose=True):
             c2 = args[1] if args[3] else args[1] * 4
         elif m is torch.nn.BatchNorm2d:
             args = [ch[f]]
+        elif m is ASFF2:
+            c2 = args[0]
+            if c2 != nc:
+                c2 = make_divisible(min(c2, max_channels) * width, 8)
+            args = [[ch[x] for x in f], c2, *args[1:]]
+        elif m is AFPN:
+            c2 = args[0]
+            if c2 != nc:
+                c2 = make_divisible(min(c2, max_channels) * width, 8)
+            args = [[ch[x] for x in f], c2, *args[1:]]
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
         elif m in frozenset(
