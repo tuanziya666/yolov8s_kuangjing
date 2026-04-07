@@ -53,6 +53,7 @@ __all__ = (
     "AFPN",
     "LSKA",
     "LDCM",
+    "P3SDER",
     "ResidualLDCM",
     "StripPooling",
     "Proto",
@@ -880,6 +881,64 @@ class LDCM(nn.Module):
         """Forward pass for the LDCM module."""
         out = self.forward_features(x)
         return out + x if self.add else out
+
+
+class P3SDER(nn.Module):
+    """P3-only Structure-Direction Enhancement Residual block."""
+
+    def __init__(self, c1: int, c2: int | None = None, shortcut: bool = True, gamma_init: float = 0.0):
+        """Initialize the P3SDER module.
+
+        Args:
+            c1 (int): Input channels.
+            c2 (int, optional): Output channels. Defaults to ``c1``.
+            shortcut (bool): Whether to enable residual scaling when input and output channels match.
+            gamma_init (float): Initial value for the learnable residual scaling factor.
+        """
+        super().__init__()
+        c2 = c1 if c2 is None else c2
+        cm = max(c1 // 2, 1)
+
+        self.local_reduce = Conv(c1, cm, 1, 1)
+        self.local_dw = nn.Conv2d(cm, cm, 3, 1, 1, groups=cm, bias=False)
+        self.local_bn = nn.BatchNorm2d(cm)
+
+        self.dir_reduce = Conv(c1, cm, 1, 1)
+        self.dir_h = nn.Conv2d(cm, cm, (1, 7), 1, (0, 3), groups=cm, bias=False)
+        self.dir_v = nn.Conv2d(cm, cm, (7, 1), 1, (3, 0), groups=cm, bias=False)
+        self.dir_bn = nn.BatchNorm2d(cm)
+
+        self.ctx_reduce = Conv(c1, cm, 1, 1)
+        self.ctx_pool = nn.AvgPool2d(5, 1, 2)
+        self.ctx_conv = nn.Conv2d(cm, cm, 1, 1, bias=False)
+        self.ctx_bn = nn.BatchNorm2d(cm)
+
+        self.act = nn.SiLU()
+        self.fuse = Conv(cm * 3, c2, 1, 1)
+        self.gate = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Conv2d(c2, c2, 1), nn.Sigmoid())
+        self.gamma = nn.Parameter(torch.tensor(float(gamma_init)))
+        self.add = shortcut and c1 == c2
+
+    def forward_features(self, x: torch.Tensor) -> torch.Tensor:
+        """Extract local, directional, and contextual enhancement features."""
+        y_local = self.local_reduce(x)
+        y_local = self.act(self.local_bn(self.local_dw(y_local)))
+
+        y_dir = self.dir_reduce(x)
+        y_dir = self.dir_h(y_dir)
+        y_dir = self.act(self.dir_bn(self.dir_v(y_dir)))
+
+        y_ctx = self.ctx_reduce(x)
+        y_ctx = self.ctx_pool(y_ctx)
+        y_ctx = self.act(self.ctx_bn(self.ctx_conv(y_ctx)))
+
+        fused = self.fuse(torch.cat((y_local, y_dir, y_ctx), 1))
+        return fused * self.gate(fused)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply residual-scaled P3 structure-direction enhancement."""
+        enhanced = self.forward_features(x)
+        return x + self.gamma * enhanced if self.add else enhanced
 
 
 class ResidualLDCM(LDCM):
