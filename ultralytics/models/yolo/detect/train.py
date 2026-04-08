@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import math
 import random
 from copy import copy
@@ -186,20 +187,45 @@ class DetectionTrainer(BaseTrainer):
             return keys
 
     def model_metrics(self) -> dict[str, float]:
-        """Return learnable residual scaling metrics for ResidualLDCM modules."""
+        """Return learnable module scalars and sample-aware loss statistics."""
         if not isinstance(self.model, nn.Module):
             return {}
 
+        metrics = {}
+        model = unwrap_model(self.model)
+
         alphas = [
             round(float(m.alpha.detach().float().cpu().item()), 6)
-            for m in unwrap_model(self.model).modules()
+            for m in model.modules()
             if isinstance(m, ResidualLDCM)
         ]
-        if not alphas:
-            return {}
         if len(alphas) == 1:
-            return {"alpha/residual_ldcm": alphas[0]}
-        return {f"alpha/residual_ldcm_{i}": alpha for i, alpha in enumerate(alphas)}
+            metrics["alpha/residual_ldcm"] = alphas[0]
+        elif alphas:
+            metrics.update({f"alpha/residual_ldcm_{i}": alpha for i, alpha in enumerate(alphas)})
+
+        criterion = getattr(model, "criterion", None)
+        bbox_loss = getattr(criterion, "bbox_loss", None) if criterion is not None else None
+        if bbox_loss is not None and hasattr(bbox_loss, "get_sample_aware_metrics"):
+            metrics.update(bbox_loss.get_sample_aware_metrics(reset=True))
+            return metrics
+
+        sa_enabled = bool(getattr(getattr(model, "args", None), "sa_box_enable", False))
+        if not sa_enabled:
+            sa_enabled = os.getenv("ULTRALYTICS_SA_BOX_ENABLE", "").strip().lower() in {"1", "true", "yes", "on"}
+        if sa_enabled:
+            metrics.update(
+                {
+                    "sa/num_positive_total": 0.0,
+                    "sa/num_small_positive": 0.0,
+                    "sa/num_elong_positive": 0.0,
+                    "sa/num_target_cls_positive": 0.0,
+                    "sa/num_drill_pipe_positive": 0.0,
+                    "sa/mean_sample_weight": 0.0,
+                    "sa/max_sample_weight": 0.0,
+                }
+            )
+        return metrics
 
     def progress_string(self):
         """Return a formatted string of training progress with epoch, GPU memory, loss, instances and size."""

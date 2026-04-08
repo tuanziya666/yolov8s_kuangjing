@@ -33,6 +33,31 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    """Read a boolean hyperparameter from the environment."""
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int_list(name: str, default: list[int]) -> list[int]:
+    """Read a comma-separated integer list from the environment."""
+    value = os.getenv(name)
+    if value is None:
+        return list(default)
+    out = []
+    for token in str(value).replace(";", ",").split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            out.append(int(token))
+        except ValueError:
+            continue
+    return out or list(default)
+
+
 class VarifocalLoss(nn.Module):
     """Varifocal loss by Zhang et al.
 
@@ -161,7 +186,7 @@ class DFLoss(nn.Module):
 class BboxLoss(nn.Module):
     """Criterion class for computing training losses for bounding boxes."""
 
-    def __init__(self, reg_max: int = 16):
+    def __init__(self, reg_max: int = 16, hyp: Any | None = None):
         """Initialize the BboxLoss module with regularization maximum and DFL settings."""
         super().__init__()
         self.dfl_loss = DFLoss(reg_max) if reg_max > 1 else None
@@ -170,6 +195,117 @@ class BboxLoss(nn.Module):
         self.wciou_ac_lambda = _env_float("ULTRALYTICS_WCIOU_AC_LAMBDA", 0.7)
         self.wciou_ac_gamma = _env_float("ULTRALYTICS_WCIOU_AC_GAMMA", 2.0)
         self.conf_eps = 1e-6
+        self.sa_box_enable = bool(getattr(hyp, "sa_box_enable", _env_bool("ULTRALYTICS_SA_BOX_ENABLE", False)))
+        self.sa_small_alpha = float(getattr(hyp, "sa_small_alpha", _env_float("ULTRALYTICS_SA_SMALL_ALPHA", 0.5)))
+        self.sa_elong_beta = float(getattr(hyp, "sa_elong_beta", _env_float("ULTRALYTICS_SA_ELONG_BETA", 0.7)))
+        self.sa_class_gamma = float(getattr(hyp, "sa_class_gamma", _env_float("ULTRALYTICS_SA_CLASS_GAMMA", 0.5)))
+        self.sa_small_area_thr = float(
+            getattr(hyp, "sa_small_area_thr", _env_float("ULTRALYTICS_SA_SMALL_AREA_THR", 0.012521))
+        )
+        self.sa_elong_ratio_thr = float(
+            getattr(hyp, "sa_elong_ratio_thr", _env_float("ULTRALYTICS_SA_ELONG_RATIO_THR", 3.0))
+        )
+        self.sa_target_class_ids = self._normalize_target_class_ids(
+            getattr(hyp, "sa_target_class_ids", _env_int_list("ULTRALYTICS_SA_TARGET_CLASS_IDS", [2]))
+        )
+        self._reset_sample_aware_stats()
+
+    @staticmethod
+    def _normalize_target_class_ids(value: Any) -> list[int]:
+        """Normalize target class IDs to a list of integers."""
+        if value is None:
+            return [2]
+        if isinstance(value, int):
+            return [value]
+        if isinstance(value, str):
+            out = []
+            for token in value.replace(";", ",").strip("[]() ").split(","):
+                token = token.strip()
+                if not token:
+                    continue
+                try:
+                    out.append(int(token))
+                except ValueError:
+                    continue
+            return out or [2]
+        if isinstance(value, (list, tuple, set)):
+            out = []
+            for item in value:
+                try:
+                    out.append(int(item))
+                except (TypeError, ValueError):
+                    continue
+            return out or [2]
+        return [2]
+
+    def _reset_sample_aware_stats(self) -> None:
+        """Reset running sample-aware weighting statistics."""
+        self.sa_num_positive_total = 0
+        self.sa_num_small_positive = 0
+        self.sa_num_elong_positive = 0
+        self.sa_num_target_cls_positive = 0
+        self.sa_weight_sum = 0.0
+        self.sa_weight_max = 0.0
+
+    def _accumulate_sample_aware_stats(
+        self, sample_weight: torch.Tensor, is_small: torch.Tensor, is_elong: torch.Tensor, is_target_cls: torch.Tensor
+    ) -> None:
+        """Accumulate sample-aware weighting statistics for the current epoch."""
+        self.sa_num_positive_total += int(sample_weight.numel())
+        self.sa_num_small_positive += int(is_small.sum().item())
+        self.sa_num_elong_positive += int(is_elong.sum().item())
+        self.sa_num_target_cls_positive += int(is_target_cls.sum().item())
+        self.sa_weight_sum += float(sample_weight.sum().item())
+        self.sa_weight_max = max(self.sa_weight_max, float(sample_weight.max().item()))
+
+    def get_sample_aware_metrics(self, reset: bool = True) -> dict[str, float]:
+        """Return epoch-level sample-aware weighting metrics."""
+        if not self.sa_box_enable:
+            return {}
+
+        total = max(self.sa_num_positive_total, 1)
+        metrics = {
+            "sa/num_positive_total": float(self.sa_num_positive_total),
+            "sa/num_small_positive": float(self.sa_num_small_positive),
+            "sa/num_elong_positive": float(self.sa_num_elong_positive),
+            "sa/num_target_cls_positive": float(self.sa_num_target_cls_positive),
+            "sa/num_drill_pipe_positive": float(self.sa_num_target_cls_positive),
+            "sa/mean_sample_weight": float(self.sa_weight_sum / total),
+            "sa/max_sample_weight": float(self.sa_weight_max),
+        }
+        if reset:
+            self._reset_sample_aware_stats()
+        return metrics
+
+    def _build_sample_aware_weight(
+        self, target_bboxes_normalized: torch.Tensor, target_scores: torch.Tensor, fg_mask: torch.Tensor
+    ) -> torch.Tensor:
+        """Build per-positive sample weights for small, elongated, and target-class boxes."""
+        if not self.sa_box_enable or target_bboxes_normalized is None:
+            return torch.ones((int(fg_mask.sum().item()), 1), device=target_scores.device, dtype=target_scores.dtype)
+
+        target_boxes_fg = target_bboxes_normalized[fg_mask]
+        target_scores_fg = target_scores[fg_mask]
+        widths = (target_boxes_fg[:, 2] - target_boxes_fg[:, 0]).clamp_min(self.conf_eps)
+        heights = (target_boxes_fg[:, 3] - target_boxes_fg[:, 1]).clamp_min(self.conf_eps)
+        areas = widths * heights
+        ratios = torch.maximum(widths / heights, heights / widths)
+        class_ids = target_scores_fg.argmax(-1)
+
+        is_small = areas < self.sa_small_area_thr
+        is_elong = ratios > self.sa_elong_ratio_thr
+        is_target_cls = torch.zeros_like(class_ids, dtype=torch.bool)
+        for class_id in self.sa_target_class_ids:
+            is_target_cls |= class_ids == class_id
+
+        sample_weight = (
+            1.0
+            + self.sa_small_alpha * is_small.float()
+            + self.sa_elong_beta * is_elong.float()
+            + self.sa_class_gamma * is_target_cls.float()
+        )
+        self._accumulate_sample_aware_stats(sample_weight, is_small, is_elong, is_target_cls)
+        return sample_weight.unsqueeze(-1).to(dtype=target_scores.dtype)
 
     def forward(
         self,
@@ -181,9 +317,11 @@ class BboxLoss(nn.Module):
         target_scores_sum: torch.Tensor,
         fg_mask: torch.Tensor,
         pred_scores: torch.Tensor | None = None,
+        target_bboxes_normalized: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute IoU and DFL losses for bounding boxes."""
         weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
+        sample_weight = self._build_sample_aware_weight(target_bboxes_normalized, target_scores, fg_mask)
         if self.iou_type == "inner_iou":
             iou = bbox_iou(
                 pred_bboxes[fg_mask],
@@ -192,7 +330,7 @@ class BboxLoss(nn.Module):
                 InnerIoU=True,
                 inner_ratio=self.inner_iou_ratio,
             )
-            loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
+            loss_iou = ((1.0 - iou) * weight * sample_weight).sum() / target_scores_sum
         elif self.iou_type == "wciou_acloss":
             if pred_scores is None:
                 raise ValueError("pred_scores must be provided when ULTRALYTICS_IOU_LOSS='wciou_acloss'.")
@@ -208,7 +346,7 @@ class BboxLoss(nn.Module):
             confidence_weight = (1.0 - matched_confidence).pow(self.wciou_ac_gamma)
             loss_ac = -torch.log(matched_confidence) * confidence_weight
             combined_loss = self.wciou_ac_lambda * loss_wciou + (1.0 - self.wciou_ac_lambda) * loss_ac
-            loss_iou = (combined_loss * weight).sum() / target_scores_sum
+            loss_iou = (combined_loss * weight * sample_weight).sum() / target_scores_sum
         else:
             if self.iou_type != "ciou":
                 LOGGER.warning(
@@ -216,12 +354,16 @@ class BboxLoss(nn.Module):
                 )
                 self.iou_type = "ciou"
             iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
-            loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
+            loss_iou = ((1.0 - iou) * weight * sample_weight).sum() / target_scores_sum
 
         # DFL loss
         if self.dfl_loss:
             target_ltrb = bbox2dist(anchor_points, target_bboxes, self.dfl_loss.reg_max - 1)
-            loss_dfl = self.dfl_loss(pred_dist[fg_mask].view(-1, self.dfl_loss.reg_max), target_ltrb[fg_mask]) * weight
+            loss_dfl = (
+                self.dfl_loss(pred_dist[fg_mask].view(-1, self.dfl_loss.reg_max), target_ltrb[fg_mask])
+                * weight
+                * sample_weight
+            )
             loss_dfl = loss_dfl.sum() / target_scores_sum
         else:
             loss_dfl = torch.tensor(0.0).to(pred_dist.device)
@@ -301,12 +443,19 @@ class v8DetectionLoss:
         self.use_dfl = m.reg_max > 1
 
         self.assigner = TaskAlignedAssigner(topk=tal_topk, num_classes=self.nc, alpha=0.5, beta=6.0)
-        self.bbox_loss = BboxLoss(m.reg_max).to(device)
+        self.bbox_loss = BboxLoss(m.reg_max, h).to(device)
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
         if self.bbox_loss.iou_type == "wciou_acloss":
             LOGGER.info(
                 "Using WCIoU-ACLoss for box regression "
                 f"(lambda={self.bbox_loss.wciou_ac_lambda:.3f}, gamma={self.bbox_loss.wciou_ac_gamma:.3f})."
+            )
+        if self.bbox_loss.sa_box_enable:
+            LOGGER.info(
+                "Using sample-aware box/DFL weighting "
+                f"(alpha={self.bbox_loss.sa_small_alpha:.3f}, beta={self.bbox_loss.sa_elong_beta:.3f}, "
+                f"gamma={self.bbox_loss.sa_class_gamma:.3f}, small_thr={self.bbox_loss.sa_small_area_thr:.6f}, "
+                f"elong_thr={self.bbox_loss.sa_elong_ratio_thr:.3f}, target_cls={self.bbox_loss.sa_target_class_ids})."
             )
         self.cls_loss_type = _env_str("ULTRALYTICS_CLS_LOSS", "bce")
         if self.cls_loss_type == "atfl":
@@ -399,6 +548,7 @@ class v8DetectionLoss:
                 target_scores_sum,
                 fg_mask,
                 pred_scores,
+                target_bboxes_normalized=target_bboxes / imgsz[[1, 0, 1, 0]],
             )
 
         loss[0] *= self.hyp.box  # box gain
