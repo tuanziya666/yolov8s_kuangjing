@@ -72,6 +72,7 @@ from ultralytics.nn.modules import (
     ResNetLayer,
     RTDETRDecoder,
     SCDown,
+    SPDConv,
     Segment,
     StripPooling,
     TorchVision,
@@ -1581,6 +1582,7 @@ def parse_model(d, ch, verbose=True):
             LDCM,
             P3SDER,
             ResidualLDCM,
+            SPDConv,
             StripPooling,
             C2fDCNv3,
         }

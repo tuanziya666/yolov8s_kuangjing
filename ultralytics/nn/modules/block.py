@@ -55,6 +55,7 @@ __all__ = (
     "LDCM",
     "P3SDER",
     "ResidualLDCM",
+    "SPDConv",
     "StripPooling",
     "Proto",
     "RepC3",
@@ -599,6 +600,30 @@ class CARAFE(nn.Module):
         x = self.upsmp(x)
         x = self.unfold(x).view(b, c, -1, h_, w_)
         return torch.einsum("bkhw,bckhw->bchw", [w_kernel, x])
+
+
+class SPDConv(nn.Module):
+    """Space-to-depth downsampling followed by a point-preserving convolution."""
+
+    def __init__(self, c1: int, c2: int, k: int = 3, act: bool = True):
+        """Initialize SPDConv.
+
+        Args:
+            c1 (int): Input channels.
+            c2 (int): Output channels.
+            k (int): Convolution kernel size after the space-to-depth transform.
+            act (bool): Whether to apply the default activation in the output convolution.
+        """
+        super().__init__()
+        self.spd = nn.PixelUnshuffle(2)
+        self.conv = Conv(c1 * 4, c2, k, 1, act=act)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Rearrange spatial information into channels before applying convolution."""
+        h, w = x.shape[-2:]
+        if h % 2 or w % 2:
+            x = F.pad(x, [0, w % 2, 0, h % 2])
+        return self.conv(self.spd(x))
 
 
 class h_sigmoid(nn.Module):

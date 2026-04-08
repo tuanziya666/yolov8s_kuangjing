@@ -68,6 +68,7 @@ from .block import (
     RepVGGDW,
     ResNetLayer,
     SCDown,
+    SPDConv,
     StripPooling,
     TorchVision,
 )
@@ -190,6 +191,7 @@ __all__ = (
     "RepVGGDW",
     "ResNetLayer",
     "SCDown",
+    "SPDConv",
     "Segment",
     "SpatialAttention",
     "StripPooling",
