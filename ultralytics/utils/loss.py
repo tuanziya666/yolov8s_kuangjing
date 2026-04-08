@@ -15,7 +15,7 @@ from ultralytics.utils.ops import crop_mask, xywh2xyxy, xyxy2xywh
 from ultralytics.utils.tal import RotatedTaskAlignedAssigner, TaskAlignedAssigner, dist2bbox, dist2rbox, make_anchors
 from ultralytics.utils.torch_utils import autocast
 
-from .metrics import bbox_iou, probiou
+from .metrics import bbox_ciou_components, bbox_iou, probiou
 from .tal import bbox2dist
 
 
@@ -167,6 +167,9 @@ class BboxLoss(nn.Module):
         self.dfl_loss = DFLoss(reg_max) if reg_max > 1 else None
         self.iou_type = _env_str("ULTRALYTICS_IOU_LOSS", "ciou")
         self.inner_iou_ratio = _env_float("ULTRALYTICS_INNER_IOU_RATIO", 0.8)
+        self.wciou_ac_lambda = _env_float("ULTRALYTICS_WCIOU_AC_LAMBDA", 0.7)
+        self.wciou_ac_gamma = _env_float("ULTRALYTICS_WCIOU_AC_GAMMA", 2.0)
+        self.conf_eps = 1e-6
 
     def forward(
         self,
@@ -177,6 +180,7 @@ class BboxLoss(nn.Module):
         target_scores: torch.Tensor,
         target_scores_sum: torch.Tensor,
         fg_mask: torch.Tensor,
+        pred_scores: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute IoU and DFL losses for bounding boxes."""
         weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
@@ -188,6 +192,23 @@ class BboxLoss(nn.Module):
                 InnerIoU=True,
                 inner_ratio=self.inner_iou_ratio,
             )
+            loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
+        elif self.iou_type == "wciou_acloss":
+            if pred_scores is None:
+                raise ValueError("pred_scores must be provided when ULTRALYTICS_IOU_LOSS='wciou_acloss'.")
+            ciou_parts = bbox_ciou_components(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False)
+            matched_target_scores = target_scores[fg_mask]
+            matched_pred_scores = pred_scores[fg_mask].sigmoid()
+            matched_confidence = (
+                (matched_pred_scores * matched_target_scores).sum(-1, keepdim=True)
+                / matched_target_scores.sum(-1, keepdim=True).clamp_min(self.conf_eps)
+            ).clamp_(self.conf_eps, 1.0)
+            occlusion_weight = torch.exp(-matched_confidence)
+            loss_wciou = (1.0 - ciou_parts["ciou"]) * occlusion_weight
+            confidence_weight = (1.0 - matched_confidence).pow(self.wciou_ac_gamma)
+            loss_ac = -torch.log(matched_confidence) * confidence_weight
+            combined_loss = self.wciou_ac_lambda * loss_wciou + (1.0 - self.wciou_ac_lambda) * loss_ac
+            loss_iou = (combined_loss * weight).sum() / target_scores_sum
         else:
             if self.iou_type != "ciou":
                 LOGGER.warning(
@@ -195,7 +216,7 @@ class BboxLoss(nn.Module):
                 )
                 self.iou_type = "ciou"
             iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
-        loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
+            loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
 
         # DFL loss
         if self.dfl_loss:
@@ -282,6 +303,11 @@ class v8DetectionLoss:
         self.assigner = TaskAlignedAssigner(topk=tal_topk, num_classes=self.nc, alpha=0.5, beta=6.0)
         self.bbox_loss = BboxLoss(m.reg_max).to(device)
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
+        if self.bbox_loss.iou_type == "wciou_acloss":
+            LOGGER.info(
+                "Using WCIoU-ACLoss for box regression "
+                f"(lambda={self.bbox_loss.wciou_ac_lambda:.3f}, gamma={self.bbox_loss.wciou_ac_gamma:.3f})."
+            )
         self.cls_loss_type = _env_str("ULTRALYTICS_CLS_LOSS", "bce")
         if self.cls_loss_type == "atfl":
             self.cls_loss_fcn = AdaptiveThresholdFocalLoss(self.bce)
@@ -372,6 +398,7 @@ class v8DetectionLoss:
                 target_scores,
                 target_scores_sum,
                 fg_mask,
+                pred_scores,
             )
 
         loss[0] *= self.hyp.box  # box gain
@@ -451,6 +478,7 @@ class v8SegmentationLoss(v8DetectionLoss):
                 target_scores,
                 target_scores_sum,
                 fg_mask,
+                pred_scores,
             )
             # Masks loss
             masks = batch["masks"].to(self.device).float()
@@ -623,7 +651,14 @@ class v8PoseLoss(v8DetectionLoss):
         if fg_mask.sum():
             target_bboxes /= stride_tensor
             loss[0], loss[4] = self.bbox_loss(
-                pred_distri, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask
+                pred_distri,
+                pred_bboxes,
+                anchor_points,
+                target_bboxes,
+                target_scores,
+                target_scores_sum,
+                fg_mask,
+                pred_scores,
             )
             keypoints = batch["keypoints"].to(self.device).float().clone()
             keypoints[..., 0] *= imgsz[1]
@@ -820,7 +855,14 @@ class v8OBBLoss(v8DetectionLoss):
         if fg_mask.sum():
             target_bboxes[..., :4] /= stride_tensor
             loss[0], loss[2] = self.bbox_loss(
-                pred_distri, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask
+                pred_distri,
+                pred_bboxes,
+                anchor_points,
+                target_bboxes,
+                target_scores,
+                target_scores_sum,
+                fg_mask,
+                pred_scores,
             )
         else:
             loss[0] += (pred_angle * 0).sum()
