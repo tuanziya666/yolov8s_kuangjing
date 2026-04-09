@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import csv
 import json
+import os
 from collections import defaultdict
 from itertools import repeat
 from multiprocessing.pool import ThreadPool
@@ -46,6 +48,74 @@ from .utils import (
 DATASET_CACHE_VERSION = "1.0.3"
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    """Read a boolean option from the environment."""
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_float(name: str, default: float) -> float:
+    """Read a float option from the environment."""
+    try:
+        return float(os.getenv(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_str(name: str, default: str = "") -> str:
+    """Read a string option from the environment."""
+    value = os.getenv(name)
+    return default if value is None else str(value).strip()
+
+
+def _env_int_list(name: str, default: list[int]) -> list[int]:
+    """Read a comma-separated integer list from the environment."""
+    value = os.getenv(name)
+    if value is None:
+        return list(default)
+    out = []
+    for token in str(value).replace(";", ",").split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            out.append(int(token))
+        except ValueError:
+            continue
+    return out or list(default)
+
+
+def _normalize_lookup_path(path: str | Path) -> str:
+    """Normalize a path string for metadata lookup."""
+    return str(Path(path)).replace("/", "\\").lower()
+
+
+def _bool_from_string(value: Any) -> bool | None:
+    """Best-effort conversion from CSV strings to boolean."""
+    if value is None:
+        return None
+    value = str(value).strip().lower()
+    if value in {"1", "true", "yes", "y", "on"}:
+        return True
+    if value in {"0", "false", "no", "n", "off"}:
+        return False
+    return None
+
+
+def _is_low_light_bucket(value: Any) -> bool | None:
+    """Interpret common brightness bucket labels."""
+    if value is None:
+        return None
+    value = str(value).strip().lower()
+    if value in {"dark", "low", "low_light", "low-light"}:
+        return True
+    if value in {"mid", "middle", "bright", "normal"}:
+        return False
+    return None
+
+
 class YOLODataset(BaseDataset):
     """Dataset class for loading object detection and/or segmentation labels in YOLO format.
 
@@ -84,8 +154,194 @@ class YOLODataset(BaseDataset):
         self.use_keypoints = task == "pose"
         self.use_obb = task == "obb"
         self.data = data
+        self.hyp = kwargs.get("hyp")
+        self.difficulty_sampler_rows = None
+        self.difficulty_sampler_weights = None
+        self.difficulty_sampler_summary = None
         assert not (self.use_segments and self.use_keypoints), "Can not use both segments and keypoints."
         super().__init__(*args, channels=self.data.get("channels", 3), **kwargs)
+
+    def _difficulty_sampler_cfg(self) -> dict[str, Any]:
+        """Collect difficulty sampler configuration from hyp/env with env as a fallback."""
+        hyp = self.hyp
+
+        def hyp_get(name: str, default: Any):
+            if isinstance(hyp, dict):
+                return hyp.get(name, default)
+            return getattr(hyp, name, default) if hyp is not None else default
+
+        return {
+            "enabled": bool(hyp_get("use_difficulty_sampler", _env_bool("ULTRALYTICS_USE_DIFFICULTY_SAMPLER", False))),
+            "drill_pipe_bonus": float(
+                hyp_get("drill_pipe_bonus", _env_float("ULTRALYTICS_DS_DRILL_PIPE_BONUS", 0.8))
+            ),
+            "coal_miner_bonus": float(
+                hyp_get("coal_miner_bonus", _env_float("ULTRALYTICS_DS_COAL_MINER_BONUS", 0.4))
+            ),
+            "low_light_scale": float(
+                hyp_get("low_light_scale", _env_float("ULTRALYTICS_DS_LOW_LIGHT_SCALE", 1.2))
+            ),
+            "elongated_scale": float(
+                hyp_get("elongated_scale", _env_float("ULTRALYTICS_DS_ELONGATED_SCALE", 1.2))
+            ),
+            "max_sample_weight": float(
+                hyp_get("max_sample_weight", _env_float("ULTRALYTICS_DS_MAX_SAMPLE_WEIGHT", 2.5))
+            ),
+            "elongated_ratio_thr": float(
+                hyp_get("elongated_ratio_thr", _env_float("ULTRALYTICS_DS_ELONGATED_RATIO_THR", 3.0))
+            ),
+            "low_light_mean_thr": float(
+                hyp_get("low_light_mean_thr", _env_float("ULTRALYTICS_DS_LOW_LIGHT_MEAN_THR", 75.0 / 255.0))
+            ),
+            "drill_pipe_class_ids": _env_int_list("ULTRALYTICS_DS_DRILL_PIPE_CLASS_IDS", [2]),
+            "coal_miner_class_ids": _env_int_list("ULTRALYTICS_DS_COAL_MINER_CLASS_IDS", [3]),
+            "attr_csv": _env_str("ULTRALYTICS_DS_ATTR_CSV", ""),
+        }
+
+    @staticmethod
+    def _build_low_light_lookup(attr_csv: str) -> tuple[dict[str, bool], dict[str, bool]]:
+        """Load optional low-light metadata from CSV keyed by path and file name."""
+        by_path, by_name = {}, {}
+        csv_path = Path(attr_csv)
+        if not attr_csv or not csv_path.exists():
+            return by_path, by_name
+
+        with csv_path.open("r", encoding="utf-8-sig", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                is_low_light = None
+                for key in ("is_low_light", "low_light", "is_dark"):
+                    is_low_light = _bool_from_string(row.get(key))
+                    if is_low_light is not None:
+                        break
+                if is_low_light is None:
+                    for key in ("brightness_group", "luma_bucket"):
+                        is_low_light = _is_low_light_bucket(row.get(key))
+                        if is_low_light is not None:
+                            break
+                if is_low_light is None:
+                    continue
+
+                for key in ("image_path", "path", "im_file"):
+                    if row.get(key):
+                        by_path[_normalize_lookup_path(row[key])] = is_low_light
+                for key in ("image_name", "name", "image"):
+                    if row.get(key):
+                        by_name[Path(row[key]).name.lower()] = is_low_light
+        return by_path, by_name
+
+    def _resolve_low_light(self, im_file: str, by_path: dict[str, bool], by_name: dict[str, bool], threshold: float) -> tuple[bool, str]:
+        """Resolve low-light state from metadata CSV first, then grayscale mean fallback."""
+        norm_path = _normalize_lookup_path(im_file)
+        name = Path(im_file).name.lower()
+        if norm_path in by_path:
+            return by_path[norm_path], "attr_csv_path"
+        if name in by_name:
+            return by_name[name], "attr_csv_name"
+
+        gray = cv2.imread(im_file, cv2.IMREAD_GRAYSCALE)
+        if gray is None:
+            return False, "fallback_read_failed"
+        return float(gray.mean()) / 255.0 < threshold, "gray_mean"
+
+    def build_difficulty_sampler_metadata(self, save_csv_path: str | Path | None = None) -> dict[str, Any] | None:
+        """Build per-image difficulty metadata and weights for WeightedRandomSampler."""
+        cfg = self._difficulty_sampler_cfg()
+        if not cfg["enabled"]:
+            return None
+        if self.rect:
+            LOGGER.warning(f"{self.prefix}Difficulty sampler is disabled because rect=True is not supported.")
+            return None
+
+        path_lookup, name_lookup = self._build_low_light_lookup(cfg["attr_csv"])
+        rows, weights = [], []
+
+        for label in self.labels:
+            im_file = str(label["im_file"])
+            cls_ids = label["cls"].reshape(-1).astype(np.int64) if len(label["cls"]) else np.empty((0,), dtype=np.int64)
+            boxes = label["bboxes"] if len(label["bboxes"]) else np.empty((0, 4), dtype=np.float32)
+
+            has_drill_pipe = bool(np.isin(cls_ids, cfg["drill_pipe_class_ids"]).any())
+            has_coal_miner = bool(np.isin(cls_ids, cfg["coal_miner_class_ids"]).any())
+
+            if len(boxes):
+                widths = np.clip(boxes[:, 2], 1e-9, None)
+                heights = np.clip(boxes[:, 3], 1e-9, None)
+                ratios = np.maximum(widths / heights, heights / widths)
+                is_elongated = bool((ratios >= cfg["elongated_ratio_thr"]).any())
+            else:
+                is_elongated = False
+
+            is_low_light, low_light_source = self._resolve_low_light(
+                im_file, path_lookup, name_lookup, cfg["low_light_mean_thr"]
+            )
+
+            weight = 1.0
+            if has_drill_pipe:
+                weight += cfg["drill_pipe_bonus"]
+            if has_coal_miner:
+                weight += cfg["coal_miner_bonus"]
+            if is_low_light:
+                weight *= cfg["low_light_scale"]
+            if is_elongated:
+                weight *= cfg["elongated_scale"]
+            weight = min(weight, cfg["max_sample_weight"])
+
+            rows.append(
+                {
+                    "image_path": im_file,
+                    "image_name": Path(im_file).name,
+                    "has_drill_pipe": has_drill_pipe,
+                    "has_coal_miner": has_coal_miner,
+                    "is_low_light": is_low_light,
+                    "is_elongated": is_elongated,
+                    "low_light_source": low_light_source,
+                    "sample_weight": weight,
+                }
+            )
+            weights.append(weight)
+
+        if save_csv_path is not None:
+            save_csv_path = Path(save_csv_path)
+            save_csv_path.parent.mkdir(parents=True, exist_ok=True)
+            with save_csv_path.open("w", encoding="utf-8", newline="") as f:
+                writer = csv.DictWriter(
+                    f,
+                    fieldnames=[
+                        "image_path",
+                        "image_name",
+                        "has_drill_pipe",
+                        "has_coal_miner",
+                        "is_low_light",
+                        "is_elongated",
+                        "low_light_source",
+                        "sample_weight",
+                    ],
+                )
+                writer.writeheader()
+                writer.writerows(rows)
+
+        weights_np = np.asarray(weights, dtype=np.float64)
+        summary = {
+            "num_samples": len(rows),
+            "num_drill_pipe_images": int(sum(row["has_drill_pipe"] for row in rows)),
+            "num_coal_miner_images": int(sum(row["has_coal_miner"] for row in rows)),
+            "num_low_light_images": int(sum(row["is_low_light"] for row in rows)),
+            "num_elongated_images": int(sum(row["is_elongated"] for row in rows)),
+            "weight_min": float(weights_np.min()) if len(weights_np) else 0.0,
+            "weight_max": float(weights_np.max()) if len(weights_np) else 0.0,
+            "weight_mean": float(weights_np.mean()) if len(weights_np) else 0.0,
+            "first_examples": [
+                (row["image_name"], round(float(row["sample_weight"]), 4)) for row in rows[:20]
+            ],
+            "csv_path": str(save_csv_path) if save_csv_path is not None else "",
+            "weights": weights_np.tolist(),
+            "rows": rows,
+        }
+        self.difficulty_sampler_rows = rows
+        self.difficulty_sampler_weights = weights_np
+        self.difficulty_sampler_summary = summary
+        return summary
 
     def cache_labels(self, path: Path = Path("./labels.cache")) -> dict:
         """Cache dataset labels, check images and read shapes.
