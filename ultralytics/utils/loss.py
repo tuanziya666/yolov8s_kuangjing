@@ -125,6 +125,25 @@ class FocalLoss(nn.Module):
         return loss.mean(1).sum()
 
 
+class QualityFocalLoss(nn.Module):
+    """Quality Focal Loss for classification targets carrying localization quality."""
+
+    def __init__(self, beta: float = 2.0):
+        """Initialize QFL with the standard modulation exponent."""
+        super().__init__()
+        self.beta = beta
+
+    def forward(self, pred: torch.Tensor, label: torch.Tensor) -> torch.Tensor:
+        """Apply BCE with a quality-aware modulation factor."""
+        with autocast(enabled=False):
+            pred = pred.float()
+            label = label.float()
+            pred_prob = pred.sigmoid()
+            scale_factor = (pred_prob - label).abs().pow(self.beta)
+            loss = F.binary_cross_entropy_with_logits(pred, label, reduction="none") * scale_factor
+        return loss.mean(1).sum()
+
+
 class AdaptiveThresholdFocalLoss(nn.Module):
     """Adaptive Threshold Focal Loss (ATFL) from EFLNet."""
 
@@ -208,6 +227,15 @@ class BboxLoss(nn.Module):
         self.sa_target_class_ids = self._normalize_target_class_ids(
             getattr(hyp, "sa_target_class_ids", _env_int_list("ULTRALYTICS_SA_TARGET_CLASS_IDS", [2]))
         )
+        self.tal_reg_enable = bool(getattr(hyp, "tal_reg_enable", _env_bool("ULTRALYTICS_TAL_REG_ENABLE", False)))
+        self.tal_reg_start_epoch = int(getattr(hyp, "tal_reg_start_epoch", _env_float("ULTRALYTICS_TAL_REG_START_EPOCH", 150)))
+        self.tal_reg_ema_decay = float(getattr(hyp, "tal_reg_ema_decay", _env_float("ULTRALYTICS_TAL_REG_EMA_DECAY", 0.95)))
+        self.tal_reg_gain = float(getattr(hyp, "tal_reg_gain", _env_float("ULTRALYTICS_TAL_REG_GAIN", 1.0)))
+        self.tal_reg_threshold = float(
+            getattr(hyp, "tal_reg_threshold", _env_float("ULTRALYTICS_TAL_REG_THRESHOLD", 0.25))
+        )
+        self.current_epoch = 0
+        self.tal_conf_ema = None
         self._reset_sample_aware_stats()
 
     @staticmethod
@@ -246,6 +274,9 @@ class BboxLoss(nn.Module):
         self.sa_num_target_cls_positive = 0
         self.sa_weight_sum = 0.0
         self.sa_weight_max = 0.0
+        self.tal_num_weighted_positive = 0
+        self.tal_weight_sum = 0.0
+        self.tal_weight_max = 0.0
 
     def _accumulate_sample_aware_stats(
         self, sample_weight: torch.Tensor, is_small: torch.Tensor, is_elong: torch.Tensor, is_target_cls: torch.Tensor
@@ -258,21 +289,41 @@ class BboxLoss(nn.Module):
         self.sa_weight_sum += float(sample_weight.sum().item())
         self.sa_weight_max = max(self.sa_weight_max, float(sample_weight.max().item()))
 
+    def _accumulate_tal_stats(self, tal_weight: torch.Tensor) -> None:
+        """Accumulate late-stage TAL reweighting statistics."""
+        self.tal_num_weighted_positive += int(tal_weight.numel())
+        self.tal_weight_sum += float(tal_weight.sum().item())
+        self.tal_weight_max = max(self.tal_weight_max, float(tal_weight.max().item()))
+
     def get_sample_aware_metrics(self, reset: bool = True) -> dict[str, float]:
         """Return epoch-level sample-aware weighting metrics."""
-        if not self.sa_box_enable:
+        if not self.sa_box_enable and not self.tal_reg_enable:
             return {}
 
-        total = max(self.sa_num_positive_total, 1)
-        metrics = {
-            "sa/num_positive_total": float(self.sa_num_positive_total),
-            "sa/num_small_positive": float(self.sa_num_small_positive),
-            "sa/num_elong_positive": float(self.sa_num_elong_positive),
-            "sa/num_target_cls_positive": float(self.sa_num_target_cls_positive),
-            "sa/num_drill_pipe_positive": float(self.sa_num_target_cls_positive),
-            "sa/mean_sample_weight": float(self.sa_weight_sum / total),
-            "sa/max_sample_weight": float(self.sa_weight_max),
-        }
+        metrics = {}
+        if self.sa_box_enable:
+            total = max(self.sa_num_positive_total, 1)
+            metrics.update(
+                {
+                    "sa/num_positive_total": float(self.sa_num_positive_total),
+                    "sa/num_small_positive": float(self.sa_num_small_positive),
+                    "sa/num_elong_positive": float(self.sa_num_elong_positive),
+                    "sa/num_target_cls_positive": float(self.sa_num_target_cls_positive),
+                    "sa/num_drill_pipe_positive": float(self.sa_num_target_cls_positive),
+                    "sa/mean_sample_weight": float(self.sa_weight_sum / total),
+                    "sa/max_sample_weight": float(self.sa_weight_max),
+                }
+            )
+        if self.tal_reg_enable:
+            tal_total = max(self.tal_num_weighted_positive, 1)
+            metrics.update(
+                {
+                    "tal/ema_conf": float(self.tal_conf_ema or 0.0),
+                    "tal/num_weighted_positive": float(self.tal_num_weighted_positive),
+                    "tal/mean_reg_weight": float(self.tal_weight_sum / tal_total),
+                    "tal/max_reg_weight": float(self.tal_weight_max),
+                }
+            )
         if reset:
             self._reset_sample_aware_stats()
         return metrics
@@ -307,6 +358,35 @@ class BboxLoss(nn.Module):
         self._accumulate_sample_aware_stats(sample_weight, is_small, is_elong, is_target_cls)
         return sample_weight.unsqueeze(-1).to(dtype=target_scores.dtype)
 
+    def _build_tal_reg_weight(self, pred_scores: torch.Tensor | None, target_scores: torch.Tensor, fg_mask: torch.Tensor) -> torch.Tensor:
+        """Late-stage task-adaptive regression weighting based on EMA-smoothed classification confidence."""
+        if (
+            not self.tal_reg_enable
+            or pred_scores is None
+            or self.current_epoch < self.tal_reg_start_epoch
+            or int(fg_mask.sum().item()) == 0
+        ):
+            return torch.ones((int(fg_mask.sum().item()), 1), device=target_scores.device, dtype=target_scores.dtype)
+
+        matched_target_scores = target_scores[fg_mask]
+        matched_pred_scores = pred_scores[fg_mask].sigmoid()
+        matched_conf = (
+            (matched_pred_scores * matched_target_scores).sum(-1, keepdim=True)
+            / matched_target_scores.sum(-1, keepdim=True).clamp_min(self.conf_eps)
+        ).detach()
+
+        batch_mean_conf = float(matched_conf.mean().item())
+        if self.tal_conf_ema is None:
+            self.tal_conf_ema = batch_mean_conf
+        else:
+            self.tal_conf_ema = self.tal_reg_ema_decay * self.tal_conf_ema + (1.0 - self.tal_reg_ema_decay) * batch_mean_conf
+
+        tal_weight = torch.ones_like(matched_conf)
+        valid_mask = matched_conf >= self.tal_reg_threshold
+        tal_weight[valid_mask] = 1.0 + self.tal_reg_gain * (matched_conf[valid_mask] - float(self.tal_conf_ema)).clamp_min(0.0)
+        self._accumulate_tal_stats(tal_weight)
+        return tal_weight.to(dtype=target_scores.dtype)
+
     def forward(
         self,
         pred_dist: torch.Tensor,
@@ -322,6 +402,8 @@ class BboxLoss(nn.Module):
         """Compute IoU and DFL losses for bounding boxes."""
         weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
         sample_weight = self._build_sample_aware_weight(target_bboxes_normalized, target_scores, fg_mask)
+        tal_reg_weight = self._build_tal_reg_weight(pred_scores, target_scores, fg_mask)
+        reg_weight = sample_weight * tal_reg_weight
         if self.iou_type == "inner_iou":
             iou = bbox_iou(
                 pred_bboxes[fg_mask],
@@ -330,7 +412,7 @@ class BboxLoss(nn.Module):
                 InnerIoU=True,
                 inner_ratio=self.inner_iou_ratio,
             )
-            loss_iou = ((1.0 - iou) * weight * sample_weight).sum() / target_scores_sum
+            loss_iou = ((1.0 - iou) * weight * reg_weight).sum() / target_scores_sum
         elif self.iou_type == "wciou_acloss":
             if pred_scores is None:
                 raise ValueError("pred_scores must be provided when ULTRALYTICS_IOU_LOSS='wciou_acloss'.")
@@ -346,7 +428,7 @@ class BboxLoss(nn.Module):
             confidence_weight = (1.0 - matched_confidence).pow(self.wciou_ac_gamma)
             loss_ac = -torch.log(matched_confidence) * confidence_weight
             combined_loss = self.wciou_ac_lambda * loss_wciou + (1.0 - self.wciou_ac_lambda) * loss_ac
-            loss_iou = (combined_loss * weight * sample_weight).sum() / target_scores_sum
+            loss_iou = (combined_loss * weight * reg_weight).sum() / target_scores_sum
         else:
             if self.iou_type != "ciou":
                 LOGGER.warning(
@@ -354,7 +436,7 @@ class BboxLoss(nn.Module):
                 )
                 self.iou_type = "ciou"
             iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
-            loss_iou = ((1.0 - iou) * weight * sample_weight).sum() / target_scores_sum
+            loss_iou = ((1.0 - iou) * weight * reg_weight).sum() / target_scores_sum
 
         # DFL loss
         if self.dfl_loss:
@@ -362,7 +444,7 @@ class BboxLoss(nn.Module):
             loss_dfl = (
                 self.dfl_loss(pred_dist[fg_mask].view(-1, self.dfl_loss.reg_max), target_ltrb[fg_mask])
                 * weight
-                * sample_weight
+                * reg_weight
             )
             loss_dfl = loss_dfl.sum() / target_scores_sum
         else:
@@ -445,10 +527,17 @@ class v8DetectionLoss:
         self.assigner = TaskAlignedAssigner(topk=tal_topk, num_classes=self.nc, alpha=0.5, beta=6.0)
         self.bbox_loss = BboxLoss(m.reg_max, h).to(device)
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
+        self.current_epoch = 0
         if self.bbox_loss.iou_type == "wciou_acloss":
             LOGGER.info(
                 "Using WCIoU-ACLoss for box regression "
                 f"(lambda={self.bbox_loss.wciou_ac_lambda:.3f}, gamma={self.bbox_loss.wciou_ac_gamma:.3f})."
+            )
+        if self.bbox_loss.tal_reg_enable:
+            LOGGER.info(
+                "Using late-stage TAL regression reweighting "
+                f"(start_epoch={self.bbox_loss.tal_reg_start_epoch}, ema_decay={self.bbox_loss.tal_reg_ema_decay:.3f}, "
+                f"gain={self.bbox_loss.tal_reg_gain:.3f}, threshold={self.bbox_loss.tal_reg_threshold:.3f})."
             )
         if self.bbox_loss.sa_box_enable:
             LOGGER.info(
@@ -457,16 +546,31 @@ class v8DetectionLoss:
                 f"gamma={self.bbox_loss.sa_class_gamma:.3f}, small_thr={self.bbox_loss.sa_small_area_thr:.6f}, "
                 f"elong_thr={self.bbox_loss.sa_elong_ratio_thr:.3f}, target_cls={self.bbox_loss.sa_target_class_ids})."
             )
+        self.aux_head_enable = _env_bool("ULTRALYTICS_AUX_HEAD_ENABLE", False)
+        self.aux_head_gain = _env_float("ULTRALYTICS_AUX_HEAD_GAIN", 0.25)
+        self.aux_small_area_thr = _env_float("ULTRALYTICS_AUX_SMALL_AREA_THR", 0.012521)
+        self.aux_target_class_ids = _env_int_list("ULTRALYTICS_AUX_TARGET_CLASS_IDS", [2])
+        self.aux_last_positive = 0
         self.cls_loss_type = _env_str("ULTRALYTICS_CLS_LOSS", "bce")
         if self.cls_loss_type == "atfl":
             self.cls_loss_fcn = AdaptiveThresholdFocalLoss(self.bce)
             LOGGER.info("Using Adaptive Threshold Focal Loss (ATFL) for detection classification loss.")
+        elif self.cls_loss_type == "qfl":
+            self.qfl_beta = _env_float("ULTRALYTICS_QFL_BETA", 2.0)
+            self.cls_loss_fcn = QualityFocalLoss(beta=self.qfl_beta)
+            LOGGER.info(f"Using Quality Focal Loss (QFL) for detection classification loss (beta={self.qfl_beta:.3f}).")
         else:
             if self.cls_loss_type != "bce":
                 LOGGER.warning(
                     f"Unknown ULTRALYTICS_CLS_LOSS='{self.cls_loss_type}', falling back to BCE classification loss."
                 )
             self.cls_loss_fcn = self.bce
+        if self.aux_head_enable:
+            LOGGER.info(
+                "Using drill_pipe small-target auxiliary head "
+                f"(gain={self.aux_head_gain:.3f}, small_thr={self.aux_small_area_thr:.6f}, "
+                f"target_cls={self.aux_target_class_ids})."
+            )
 
     def preprocess(self, targets: torch.Tensor, batch_size: int, scale_tensor: torch.Tensor) -> torch.Tensor:
         """Preprocess targets by converting to tensor format and scaling coordinates."""
@@ -494,35 +598,54 @@ class v8DetectionLoss:
             # pred_dist = (pred_dist.view(b, a, c // 4, 4).softmax(2) * self.proj.type(pred_dist.dtype).view(1, 1, -1, 1)).sum(2)
         return dist2bbox(pred_dist, anchor_points, xywh=False)
 
-    def __call__(self, preds: Any, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
-        """Calculate the sum of the loss for box, cls and dfl multiplied by batch size."""
+    def _hyp_value(self, name: str, default: float) -> float:
+        """Read a hyperparameter from either a namespace-like object or a dict."""
+        if isinstance(self.hyp, dict):
+            return float(self.hyp.get(name, default))
+        return float(getattr(self.hyp, name, default))
+
+    def _filter_aux_batch(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor] | None:
+        """Keep only small drill_pipe-style targets for the auxiliary head."""
+        cls = batch["cls"].view(-1)
+        bboxes = batch["bboxes"]
+        area = bboxes[:, 2] * bboxes[:, 3]
+
+        target_mask = torch.zeros_like(cls, dtype=torch.bool)
+        for class_id in self.aux_target_class_ids:
+            target_mask |= cls == class_id
+        target_mask &= area < self.aux_small_area_thr
+
+        self.aux_last_positive = int(target_mask.sum().item())
+        if self.aux_last_positive == 0:
+            return None
+
+        aux_batch = dict(batch)
+        aux_batch["batch_idx"] = batch["batch_idx"][target_mask]
+        aux_batch["cls"] = batch["cls"][target_mask]
+        aux_batch["bboxes"] = batch["bboxes"][target_mask]
+        return aux_batch
+
+    def _compute_path_loss(self, feats: list[torch.Tensor], batch: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Compute standard YOLO detection loss for one prediction path."""
         loss = torch.zeros(3, device=self.device)  # box, cls, dfl
-        feats = preds[1] if isinstance(preds, tuple) else preds
         pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
             (self.reg_max * 4, self.nc), 1
         )
 
         pred_scores = pred_scores.permute(0, 2, 1).contiguous()
         pred_distri = pred_distri.permute(0, 2, 1).contiguous()
-
         dtype = pred_scores.dtype
         batch_size = pred_scores.shape[0]
-        imgsz = torch.tensor(feats[0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]  # image size (h,w)
-        anchor_points, stride_tensor = make_anchors(feats, self.stride, 0.5)
+        imgsz = torch.tensor(feats[0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]
+        anchor_points, stride_tensor = make_anchors(feats, self.stride[: len(feats)], 0.5)
 
-        # Targets
         targets = torch.cat((batch["batch_idx"].view(-1, 1), batch["cls"].view(-1, 1), batch["bboxes"]), 1)
         targets = self.preprocess(targets, batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
-        gt_labels, gt_bboxes = targets.split((1, 4), 2)  # cls, xyxy
+        gt_labels, gt_bboxes = targets.split((1, 4), 2)
         mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0.0)
 
-        # Pboxes
-        pred_bboxes = self.bbox_decode(anchor_points, pred_distri)  # xyxy, (b, h*w, 4)
-        # dfl_conf = pred_distri.view(batch_size, -1, 4, self.reg_max).detach().softmax(-1)
-        # dfl_conf = (dfl_conf.amax(-1).mean(-1) + dfl_conf.amax(-1).amin(-1)) / 2
-
+        pred_bboxes = self.bbox_decode(anchor_points, pred_distri)
         _, target_bboxes, target_scores, fg_mask, _ = self.assigner(
-            # pred_scores.detach().sigmoid() * 0.8 + dfl_conf.unsqueeze(-1) * 0.2,
             pred_scores.detach().sigmoid(),
             (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),
             anchor_points * stride_tensor,
@@ -532,13 +655,10 @@ class v8DetectionLoss:
         )
 
         target_scores_sum = max(target_scores.sum(), 1)
-
-        # Cls loss
-        # loss[1] = self.varifocal_loss(pred_scores, target_scores, target_labels) / target_scores_sum  # VFL way
         loss[1] = self.cls_loss_fcn(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum
 
-        # Bbox loss
         if fg_mask.sum():
+            self.bbox_loss.current_epoch = self.current_epoch
             loss[0], loss[2] = self.bbox_loss(
                 pred_distri,
                 pred_bboxes,
@@ -551,11 +671,29 @@ class v8DetectionLoss:
                 target_bboxes_normalized=target_bboxes / imgsz[[1, 0, 1, 0]],
             )
 
-        loss[0] *= self.hyp.box  # box gain
-        loss[1] *= self.hyp.cls  # cls gain
-        loss[2] *= self.hyp.dfl  # dfl gain
+        loss[0] *= self._hyp_value("box", 7.5)
+        loss[1] *= self._hyp_value("cls", 0.5)
+        loss[2] *= self._hyp_value("dfl", 1.5)
+        return loss
 
-        return loss * batch_size, loss.detach()  # loss(box, cls, dfl)
+    def __call__(self, preds: Any, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+        """Calculate the sum of the loss for box, cls and dfl multiplied by batch size."""
+        self.bbox_loss.current_epoch = self.current_epoch
+        batch_size = batch["img"].shape[0]
+
+        if isinstance(preds, dict):
+            main_feats = preds["main"]
+            loss = self._compute_path_loss(main_feats, batch)
+            aux_feats = preds.get("aux")
+            if self.aux_head_enable and aux_feats is not None:
+                aux_batch = self._filter_aux_batch(batch)
+                if aux_batch is not None:
+                    loss = loss + self.aux_head_gain * self._compute_path_loss(aux_feats, aux_batch)
+            return loss * batch_size, loss.detach()
+
+        feats = preds[1] if isinstance(preds, tuple) else preds
+        loss = self._compute_path_loss(feats, batch)
+        return loss * batch_size, loss.detach()
 
 
 class v8SegmentationLoss(v8DetectionLoss):

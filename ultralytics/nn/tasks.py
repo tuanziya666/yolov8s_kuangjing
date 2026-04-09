@@ -53,6 +53,7 @@ from ultralytics.nn.modules import (
     Detect,
     DWConv,
     DWConvTranspose2d,
+    DySnakeConv,
     Focus,
     GhostBottleneck,
     GhostConv,
@@ -74,8 +75,10 @@ from ultralytics.nn.modules import (
     RTDETRDecoder,
     SCDown,
     SPDConv,
+    STCDetect,
     Segment,
     StripPooling,
+    TSCODEDetect,
     TorchVision,
     WorldDetect,
     YOLOEDetect,
@@ -335,6 +338,8 @@ class BaseModel(torch.nn.Module):
         """
         if getattr(self, "criterion", None) is None:
             self.criterion = self.init_criterion()
+        if hasattr(self, "current_epoch") and hasattr(self.criterion, "current_epoch"):
+            self.criterion.current_epoch = self.current_epoch
 
         if preds is None:
             preds = self.forward(batch["img"])
@@ -421,7 +426,8 @@ class DetectionModel(BaseModel):
                     """Perform a forward pass through the model, handling different Detect subclass types accordingly."""
                     if self.end2end:
                         return self.forward(x)["one2many"]
-                    return self.forward(x)[0] if isinstance(m, (Segment, YOLOESegment, Pose, OBB)) else self.forward(x)
+                    out = self.forward(x)[0] if isinstance(m, (Segment, YOLOESegment, Pose, OBB)) else self.forward(x)
+                    return out["main"] if isinstance(out, dict) else out
 
                 self.model.eval()  # Avoid changing batch statistics until training begins
                 m.training = True  # Setting it to True to properly return strides
@@ -1553,6 +1559,7 @@ def parse_model(d, ch, verbose=True):
             C2fPSA,
             C2PSA,
             DWConv,
+            DySnakeConv,
             Focus,
             BottleneckCSP,
             C1,
@@ -1671,12 +1678,24 @@ def parse_model(d, ch, verbose=True):
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
         elif m in frozenset(
-            {Detect, WorldDetect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, ImagePoolingAttn, v10Detect}
+            {
+                Detect,
+                STCDetect,
+                TSCODEDetect,
+                WorldDetect,
+                YOLOEDetect,
+                Segment,
+                YOLOESegment,
+                Pose,
+                OBB,
+                ImagePoolingAttn,
+                v10Detect,
+            }
         ):
             args.append([ch[x] for x in f])
             if m is Segment or m is YOLOESegment:
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
-            if m in {Detect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB}:
+            if m in {Detect, STCDetect, TSCODEDetect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB}:
                 m.legacy = legacy
         elif m is RTDETRDecoder:  # special case, channels arg must be passed in index 1
             args.insert(1, [ch[x] for x in f])

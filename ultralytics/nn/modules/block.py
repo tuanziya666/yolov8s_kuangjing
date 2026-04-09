@@ -42,6 +42,7 @@ __all__ = (
     "CBFuse",
     "CBLinear",
     "ContrastiveHead",
+    "GCBlock",
     "GhostBottleneck",
     "HGBlock",
     "HGStem",
@@ -51,7 +52,7 @@ __all__ = (
     "CSPStage",
     "C2fDCNv3",
     "CoordAtt",
-    "GCBlock",
+    "DySnakeConv",
     "AFPN",
     "LSKA",
     "LDCM",
@@ -672,6 +673,88 @@ class SPDConv(nn.Module):
         if h % 2 or w % 2:
             x = F.pad(x, [0, w % 2, 0, h % 2])
         return self.conv(self.spd(x))
+
+
+class DySnakeConv(nn.Module):
+    """Lightweight dynamic snake-style downsampling for tubular structures."""
+
+    def __init__(self, c1: int, c2: int, k: int = 5, scale: int = 2, offset_scale: float = 1.0):
+        """Initialize DySnakeConv with horizontal and vertical snake sampling branches."""
+        super().__init__()
+        if k % 2 == 0:
+            raise ValueError("DySnakeConv expects an odd kernel size.")
+        self.k = k
+        self.radius = k // 2
+        self.scale = scale
+        self.offset_scale = offset_scale
+        hidden = max(c2 // 2, 16)
+
+        self.pre = Conv(c1, hidden, 1, 1)
+        self.guide = nn.Sequential(nn.AvgPool2d(scale, scale, ceil_mode=True), Conv(hidden, hidden, 3, 1))
+        self.offset_h = nn.Conv2d(hidden, k, 3, 1, 1)
+        self.offset_v = nn.Conv2d(hidden, k, 3, 1, 1)
+
+        self.base_proj = Conv(hidden, hidden, 1, 1)
+        self.branch_h = Conv(hidden * k, hidden, 1, 1)
+        self.branch_v = Conv(hidden * k, hidden, 1, 1)
+        self.fuse = Conv(hidden * 3, c2, 1, 1)
+
+    def _build_snake_offsets(self, offsets: torch.Tensor) -> torch.Tensor:
+        """Convert raw offsets into smooth cumulative snake-like offsets."""
+        offsets = torch.tanh(offsets) * self.offset_scale
+        snake = torch.zeros_like(offsets)
+        center = self.radius
+        snake[:, center] = 0.0
+        for idx in range(center + 1, self.k):
+            snake[:, idx] = snake[:, idx - 1] + offsets[:, idx]
+        for idx in range(center - 1, -1, -1):
+            snake[:, idx] = snake[:, idx + 1] + offsets[:, idx]
+        return snake
+
+    def _sample_branch(self, feat: torch.Tensor, offsets: torch.Tensor, axis: str) -> torch.Tensor:
+        """Sample a snake-like strip along the chosen axis using grid_sample."""
+        b, c, h, w = feat.shape
+        gh, gw = offsets.shape[-2:]
+        dtype, device = feat.dtype, feat.device
+
+        ys = torch.arange(gh, device=device, dtype=dtype) * self.scale + (self.scale - 1) / 2
+        xs = torch.arange(gw, device=device, dtype=dtype) * self.scale + (self.scale - 1) / 2
+        base_y, base_x = torch.meshgrid(ys, xs, indexing="ij")
+        base_y = base_y.unsqueeze(0).unsqueeze(0).expand(b, self.k, -1, -1)
+        base_x = base_x.unsqueeze(0).unsqueeze(0).expand(b, self.k, -1, -1)
+        deltas = torch.arange(-self.radius, self.radius + 1, device=device, dtype=dtype).view(1, self.k, 1, 1)
+
+        if axis == "x":
+            sample_y = base_y
+            sample_x = base_x + deltas + offsets
+        else:
+            sample_y = base_y + deltas + offsets
+            sample_x = base_x
+
+        sample_x = sample_x / max(w - 1, 1) * 2 - 1
+        sample_y = sample_y / max(h - 1, 1) * 2 - 1
+
+        samples = []
+        for idx in range(self.k):
+            grid = torch.stack((sample_x[:, idx], sample_y[:, idx]), dim=-1)
+            samples.append(F.grid_sample(feat, grid, mode="bilinear", padding_mode="border", align_corners=True))
+        return torch.cat(samples, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Downsample while dynamically tracing tubular structures."""
+        h, w = x.shape[-2:]
+        if h % self.scale or w % self.scale:
+            x = F.pad(x, [0, w % self.scale, 0, h % self.scale])
+
+        feat = self.pre(x)
+        guide = self.guide(feat)
+        offset_h = self._build_snake_offsets(self.offset_h(guide))
+        offset_v = self._build_snake_offsets(self.offset_v(guide))
+
+        base = self.base_proj(F.avg_pool2d(feat, self.scale, self.scale, ceil_mode=True))
+        snake_h = self.branch_h(self._sample_branch(feat, offset_h, axis="x"))
+        snake_v = self.branch_v(self._sample_branch(feat, offset_v, axis="y"))
+        return self.fuse(torch.cat((base, snake_h, snake_v), 1))
 
 
 class h_sigmoid(nn.Module):

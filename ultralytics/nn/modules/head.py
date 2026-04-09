@@ -20,7 +20,55 @@ from .conv import Conv, DWConv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob, linear_init
 
-__all__ = "OBB", "Classify", "Detect", "Pose", "RTDETRDecoder", "Segment", "YOLOEDetect", "YOLOESegment", "v10Detect"
+__all__ = (
+    "OBB",
+    "Classify",
+    "Detect",
+    "Pose",
+    "RTDETRDecoder",
+    "Segment",
+    "STCDetect",
+    "TSCODEDetect",
+    "YOLOEDetect",
+    "YOLOESegment",
+    "v10Detect",
+)
+
+
+class _CenterContextGate(nn.Module):
+    """Lightweight center-focused gate for the classification branch."""
+
+    def __init__(self, c1: int):
+        super().__init__()
+        hidden = max(c1 // 4, 16)
+        self.gate = nn.Sequential(
+            Conv(c1, hidden, 1),
+            DWConv(hidden, hidden, 3),
+            nn.Conv2d(hidden, 1, 1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x * self.gate(x)
+
+
+class _EdgeContextGate(nn.Module):
+    """High-pass style gate for the regression branch."""
+
+    def __init__(self, c1: int):
+        super().__init__()
+        hidden = max(c1 // 4, 16)
+        self.pool = nn.AvgPool2d(kernel_size=3, stride=1, padding=1)
+        self.gate = nn.Sequential(
+            Conv(c1, hidden, 1),
+            DWConv(hidden, hidden, 3),
+            nn.Conv2d(hidden, 1, 1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        edge = x - self.pool(x)
+        return x * (1.0 + self.gate(edge))
 
 
 class Detect(nn.Module):
@@ -210,6 +258,68 @@ class Detect(nn.Module):
         scores, index = scores.flatten(1).topk(min(max_det, anchors))
         i = torch.arange(batch_size)[..., None]  # batch indices
         return torch.cat([boxes[i, index // nc], scores[..., None], (index % nc)[..., None].float()], dim=-1)
+
+
+class TSCODEDetect(Detect):
+    """Task-specific context decoupled detect head inspired by TSCODE-style branch separation."""
+
+    def __init__(self, nc: int = 80, ch: tuple = ()):
+        """Initialize the standard Detect head plus task-specific context gates."""
+        super().__init__(nc, ch)
+        self.cls_context = nn.ModuleList(_CenterContextGate(x) for x in ch)
+        self.reg_context = nn.ModuleList(_EdgeContextGate(x) for x in ch)
+
+    def forward(self, x: list[torch.Tensor]) -> list[torch.Tensor] | tuple:
+        """Apply branch-specific context gating before classification/regression prediction."""
+        if self.end2end:
+            return self.forward_end2end(x)
+
+        for i in range(self.nl):
+            reg_feat = self.reg_context[i](x[i])
+            cls_feat = self.cls_context[i](x[i])
+            x[i] = torch.cat((self.cv2[i](reg_feat), self.cv3[i](cls_feat)), 1)
+        if self.training:
+            return x
+        y = self._inference(x)
+        return y if self.export else (y, x)
+
+
+class STCDetect(Detect):
+    """Detect head with a training-only auxiliary P3 branch for hard small targets."""
+
+    def __init__(self, nc: int = 80, ch: tuple = ()):
+        """Initialize the standard detect head plus a P3-only auxiliary head."""
+        super().__init__(nc, ch)
+        c2, c3 = max((16, ch[0] // 4, self.reg_max * 4)), max(ch[0], min(self.nc, 100))
+        self.aux_cv2 = nn.Sequential(Conv(ch[0], c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, 4 * self.reg_max, 1))
+        self.aux_cv3 = (
+            nn.Sequential(Conv(ch[0], c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, self.nc, 1))
+            if self.legacy
+            else nn.Sequential(
+                nn.Sequential(DWConv(ch[0], ch[0], 3), Conv(ch[0], c3, 1)),
+                nn.Sequential(DWConv(c3, c3, 3), Conv(c3, c3, 1)),
+                nn.Conv2d(c3, self.nc, 1),
+            )
+        )
+
+    def forward(self, x: list[torch.Tensor]) -> list[torch.Tensor] | tuple | dict[str, list[torch.Tensor]]:
+        """Return normal predictions and a training-only P3 auxiliary branch."""
+        if self.end2end:
+            return self.forward_end2end(x)
+
+        main = [torch.cat((self.cv2[i](x[i]), self.cv3[i](x[i])), 1) for i in range(self.nl)]
+        if self.training:
+            aux = [torch.cat((self.aux_cv2(x[0]), self.aux_cv3(x[0])), 1)]
+            return {"main": main, "aux": aux}
+
+        y = self._inference(main)
+        return y if self.export else (y, main)
+
+    def bias_init(self):
+        """Initialize main and auxiliary biases after strides are available."""
+        super().bias_init()
+        self.aux_cv2[-1].bias.data[:] = 1.0
+        self.aux_cv3[-1].bias.data[: self.nc] = math.log(5 / self.nc / (640 / self.stride[0]) ** 2)
 
 
 class Segment(Detect):

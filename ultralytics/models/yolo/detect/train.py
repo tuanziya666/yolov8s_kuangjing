@@ -6,11 +6,13 @@ import os
 import math
 import random
 from copy import copy
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.utils.data import WeightedRandomSampler
 
 from ultralytics.data import build_dataloader, build_yolo_dataset
 from ultralytics.engine.trainer import BaseTrainer
@@ -97,6 +99,47 @@ class DetectionTrainer(BaseTrainer):
         if getattr(dataset, "rect", False) and shuffle:
             LOGGER.warning("'rect=True' is incompatible with DataLoader shuffle, setting shuffle=False")
             shuffle = False
+        sampler = None
+        if mode == "train" and hasattr(dataset, "build_difficulty_sampler_metadata"):
+            use_difficulty_sampler = os.getenv("ULTRALYTICS_USE_DIFFICULTY_SAMPLER", "").strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+            if use_difficulty_sampler:
+                if rank != -1:
+                    LOGGER.warning("Difficulty sampler is disabled in distributed training; falling back to default sampler.")
+                else:
+                    summary = dataset.build_difficulty_sampler_metadata(self.save_dir / "train_sample_weights.csv")
+                    if summary is not None:
+                        weights = torch.as_tensor(summary["weights"], dtype=torch.double)
+                        generator = torch.Generator()
+                        generator.manual_seed(int(getattr(self.args, "seed", 0)) + 1024)
+                        sampler = WeightedRandomSampler(
+                            weights=weights,
+                            num_samples=len(weights),
+                            replacement=True,
+                            generator=generator,
+                        )
+                        shuffle = False
+                        LOGGER.info("Using difficulty-weighted train sampler with WeightedRandomSampler.")
+                        LOGGER.info(f"train sample count: {summary['num_samples']}")
+                        LOGGER.info(
+                            "difficulty sampler condition counts: "
+                            f"drill_pipe={summary['num_drill_pipe_images']}, "
+                            f"coal_miner={summary['num_coal_miner_images']}, "
+                            f"low_light={summary['num_low_light_images']}, "
+                            f"elongated={summary['num_elongated_images']}"
+                        )
+                        LOGGER.info(
+                            "difficulty sampler weight stats: "
+                            f"min={summary['weight_min']:.4f}, "
+                            f"max={summary['weight_max']:.4f}, "
+                            f"mean={summary['weight_mean']:.4f}"
+                        )
+                        LOGGER.info(f"difficulty sampler CSV: {summary['csv_path']}")
+                        LOGGER.info(f"first 20 sample weights: {summary['first_examples']}")
         return build_dataloader(
             dataset,
             batch=batch_size,
@@ -104,6 +147,7 @@ class DetectionTrainer(BaseTrainer):
             shuffle=shuffle,
             rank=rank,
             drop_last=self.args.compile and mode == "train",
+            sampler=sampler,
         )
 
     def preprocess_batch(self, batch: dict) -> dict:
@@ -208,11 +252,15 @@ class DetectionTrainer(BaseTrainer):
         bbox_loss = getattr(criterion, "bbox_loss", None) if criterion is not None else None
         if bbox_loss is not None and hasattr(bbox_loss, "get_sample_aware_metrics"):
             metrics.update(bbox_loss.get_sample_aware_metrics(reset=True))
+            if hasattr(criterion, "aux_head_enable") and criterion.aux_head_enable:
+                metrics["aux/last_positive"] = float(getattr(criterion, "aux_last_positive", 0))
             return metrics
 
         sa_enabled = bool(getattr(getattr(model, "args", None), "sa_box_enable", False))
         if not sa_enabled:
             sa_enabled = os.getenv("ULTRALYTICS_SA_BOX_ENABLE", "").strip().lower() in {"1", "true", "yes", "on"}
+        tal_enabled = os.getenv("ULTRALYTICS_TAL_REG_ENABLE", "").strip().lower() in {"1", "true", "yes", "on"}
+        aux_enabled = os.getenv("ULTRALYTICS_AUX_HEAD_ENABLE", "").strip().lower() in {"1", "true", "yes", "on"}
         if sa_enabled:
             metrics.update(
                 {
@@ -225,6 +273,17 @@ class DetectionTrainer(BaseTrainer):
                     "sa/max_sample_weight": 0.0,
                 }
             )
+        if tal_enabled:
+            metrics.update(
+                {
+                    "tal/ema_conf": 0.0,
+                    "tal/num_weighted_positive": 0.0,
+                    "tal/mean_reg_weight": 0.0,
+                    "tal/max_reg_weight": 0.0,
+                }
+            )
+        if aux_enabled:
+            metrics["aux/last_positive"] = 0.0
         return metrics
 
     def progress_string(self):
