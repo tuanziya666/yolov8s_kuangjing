@@ -32,6 +32,7 @@ __all__ = (
     "Bottleneck",
     "BottleneckCSP",
     "C2f",
+    "C2fGC",
     "C2fAttn",
     "C2fCIB",
     "C2fPSA",
@@ -50,6 +51,7 @@ __all__ = (
     "CSPStage",
     "C2fDCNv3",
     "CoordAtt",
+    "GCBlock",
     "AFPN",
     "LSKA",
     "LDCM",
@@ -324,6 +326,52 @@ class C2f(nn.Module):
         y = [y[0], y[1]]
         y.extend(m(y[-1]) for m in self.m)
         return self.cv2(torch.cat(y, 1))
+
+
+class GCBlock(nn.Module):
+    """Lightweight Global Context block inspired by GCNet."""
+
+    def __init__(self, c1: int, reduction: int = 16):
+        """Initialize context pooling and channel transform layers."""
+        super().__init__()
+        hidden = max(c1 // reduction, 1)
+        self.conv_mask = nn.Conv2d(c1, 1, 1)
+        self.softmax = nn.Softmax(dim=2)
+        self.channel_add_conv = nn.Sequential(
+            nn.Conv2d(c1, hidden, 1, bias=False),
+            nn.SiLU(),
+            nn.Conv2d(hidden, c1, 1, bias=False),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Aggregate global context and add it back to the input."""
+        b, c, h, w = x.shape
+        context_mask = self.conv_mask(x).view(b, 1, h * w)
+        context_mask = self.softmax(context_mask)
+        context = torch.matmul(x.view(b, c, h * w), context_mask.transpose(1, 2)).view(b, c, 1, 1)
+        return x + self.channel_add_conv(context)
+
+
+class C2fGC(C2f):
+    """C2f block followed by lightweight global context refinement."""
+
+    def __init__(
+        self,
+        c1: int,
+        c2: int,
+        n: int = 1,
+        shortcut: bool = False,
+        g: int = 1,
+        e: float = 0.5,
+        gc_reduction: int = 16,
+    ):
+        """Initialize a C2f block with a GCBlock appended at the output."""
+        super().__init__(c1, c2, n=n, shortcut=shortcut, g=g, e=e)
+        self.gc = GCBlock(c2, reduction=gc_reduction)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run C2f mixing and refine with a global context residual."""
+        return self.gc(super().forward(x))
 
 
 class C3(nn.Module):
