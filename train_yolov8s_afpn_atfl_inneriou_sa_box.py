@@ -3,6 +3,7 @@ import os
 import warnings
 from pathlib import Path
 
+import torch
 from ultralytics import YOLO
 from ultralytics.utils import SETTINGS
 
@@ -152,9 +153,31 @@ def configure_env(args) -> None:
     os.environ["ULTRALYTICS_USE_DIFFICULTY_SAMPLER"] = "0"
 
 
+def resolve_device(device: str) -> str:
+    device = str(device).strip()
+    if not device or device.lower() == "cpu":
+        return device
+    if "," not in device:
+        return device
+    if not torch.cuda.is_available():
+        return device.split(",")[0].strip()
+
+    requested = [d.strip() for d in device.split(",") if d.strip()]
+    available = torch.cuda.device_count()
+    if len(requested) > available:
+        fallback = requested[0] if requested else "0"
+        print(
+            f"warning = requested device '{device}' but only {available} CUDA device(s) are available; "
+            f"falling back to '{fallback}'"
+        )
+        return fallback
+    return device
+
+
 def main():
     args = parse_args()
     configure_env(args)
+    resolved_device = resolve_device(args.device)
 
     print("model =", args.model)
     print("pretrained =", args.pretrained)
@@ -162,7 +185,7 @@ def main():
     print("epochs =", args.epochs)
     print("batch =", args.batch)
     print("imgsz =", args.imgsz)
-    print("device =", args.device)
+    print("device =", resolved_device)
     print("optimizer =", args.optimizer)
     print("seed =", args.seed)
     print("cls_loss =", os.getenv("ULTRALYTICS_CLS_LOSS"))
@@ -183,7 +206,7 @@ def main():
         "task": "detect",
         "project": args.project,
         "name": args.name,
-        "device": args.device,
+        "device": resolved_device,
         "epochs": args.epochs,
         "batch": args.batch,
         "imgsz": args.imgsz,
