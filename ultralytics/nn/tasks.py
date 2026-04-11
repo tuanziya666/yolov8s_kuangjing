@@ -51,6 +51,7 @@ from ultralytics.nn.modules import (
     ConvTranspose,
     CoordAtt,
     ECA,
+    SimAM,
     Detect,
     DWConv,
     DWConvTranspose2d,
@@ -1657,6 +1658,9 @@ def parse_model(d, ch, verbose=True):
                 legacy = False
         elif m is AIFI:
             args = [ch[f], *args]
+        elif m is SimAM:
+            c2 = ch[f]
+            args = []
         elif m in frozenset({HGStem, HGBlock}):
             c1, cm, c2 = ch[f], args[0], args[1]
             args = [c1, cm, c2, *args[2:]]

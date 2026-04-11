@@ -55,6 +55,7 @@ __all__ = (
     "C2fDCNv3",
     "CoordAtt",
     "ECA",
+    "SimAM",
     "DySnakeConv",
     "AFPN",
     "LSKA",
@@ -2611,3 +2612,22 @@ class ECA(nn.Module):
         y = self.conv(y.squeeze(-1).transpose(-1, -2))
         y = y.transpose(-1, -2).unsqueeze(-1)
         return x * self.sigmoid(y)
+
+
+class SimAM(nn.Module):
+    """Simple parameter-free attention module."""
+
+    def __init__(self, e_lambda: float = 1e-4):
+        """Initialize SimAM with the stability term from the original paper."""
+        super().__init__()
+        self.e_lambda = e_lambda
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply SimAM attention to the input feature map."""
+        _, _, h, w = x.size()
+        n = max(h * w - 1, 1)
+        mean = x.mean(dim=[2, 3], keepdim=True)
+        var = (x - mean).pow(2).sum(dim=[2, 3], keepdim=True) / n
+        e_inv = (x - mean).pow(2) / (4 * (var + self.e_lambda)) + 0.5
+        return x * self.sigmoid(e_inv)
