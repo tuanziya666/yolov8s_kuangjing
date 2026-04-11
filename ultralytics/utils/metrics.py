@@ -84,6 +84,7 @@ def bbox_iou(
     GIoU: bool = False,
     DIoU: bool = False,
     CIoU: bool = False,
+    MPDIoU: bool = False,
     InnerIoU: bool = False,
     inner_ratio: float = 0.8,
     eps: float = 1e-7,
@@ -102,12 +103,13 @@ def bbox_iou(
         GIoU (bool, optional): If True, calculate Generalized IoU.
         DIoU (bool, optional): If True, calculate Distance IoU.
         CIoU (bool, optional): If True, calculate Complete IoU.
+        MPDIoU (bool, optional): If True, calculate Minimum Point Distance IoU.
         InnerIoU (bool, optional): If True, calculate IoU on ratio-scaled inner boxes.
         inner_ratio (float, optional): Inner-box scaling ratio used by Inner-IoU.
         eps (float, optional): A small value to avoid division by zero.
 
     Returns:
-        (torch.Tensor): IoU, GIoU, DIoU, or CIoU values depending on the specified flags.
+        (torch.Tensor): IoU, GIoU, DIoU, CIoU, or MPDIoU values depending on the specified flags.
     """
     # Get the coordinates of bounding boxes
     if xywh:  # transform from xywh to xyxy
@@ -146,9 +148,14 @@ def bbox_iou(
         ).clamp_(0)
         inner_union = inner_w1 * inner_h1 + inner_w2 * inner_h2 - inner_inter + eps
         return inner_inter / inner_union
-    if CIoU or DIoU or GIoU:
+    if MPDIoU or CIoU or DIoU or GIoU:
         cw = b1_x2.maximum(b2_x2) - b1_x1.minimum(b2_x1)  # convex (smallest enclosing box) width
         ch = b1_y2.maximum(b2_y2) - b1_y1.minimum(b2_y1)  # convex height
+        if MPDIoU:
+            c2 = cw.pow(2) + ch.pow(2) + eps
+            d1 = (b2_x1 - b1_x1).pow(2) + (b2_y1 - b1_y1).pow(2)
+            d2 = (b2_x2 - b1_x2).pow(2) + (b2_y2 - b1_y2).pow(2)
+            return iou - d1 / c2 - d2 / c2
         if CIoU or DIoU:  # Distance or Complete IoU https://arxiv.org/abs/1911.08287v1
             c2 = cw.pow(2) + ch.pow(2) + eps  # convex diagonal squared
             rho2 = (

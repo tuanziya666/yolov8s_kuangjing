@@ -413,6 +413,9 @@ class BboxLoss(nn.Module):
                 inner_ratio=self.inner_iou_ratio,
             )
             loss_iou = ((1.0 - iou) * weight * reg_weight).sum() / target_scores_sum
+        elif self.iou_type == "mpdiou":
+            iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, MPDIoU=True)
+            loss_iou = ((1.0 - iou) * weight * reg_weight).sum() / target_scores_sum
         elif self.iou_type == "wciou_acloss":
             if pred_scores is None:
                 raise ValueError("pred_scores must be provided when ULTRALYTICS_IOU_LOSS='wciou_acloss'.")
@@ -528,6 +531,8 @@ class v8DetectionLoss:
         self.bbox_loss = BboxLoss(m.reg_max, h).to(device)
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
         self.current_epoch = 0
+        if self.bbox_loss.iou_type == "mpdiou":
+            LOGGER.info("Using MPDIoU for box regression (minimum point distance IoU).")
         if self.bbox_loss.iou_type == "wciou_acloss":
             LOGGER.info(
                 "Using WCIoU-ACLoss for box regression "
