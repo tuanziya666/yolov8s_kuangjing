@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -52,6 +54,7 @@ __all__ = (
     "CSPStage",
     "C2fDCNv3",
     "CoordAtt",
+    "ECA",
     "DySnakeConv",
     "AFPN",
     "LSKA",
@@ -2587,3 +2590,24 @@ class SAVPE(nn.Module):
         aggregated = score.transpose(-2, -3) @ x.reshape(B, self.c, C // self.c, -1).transpose(-1, -2)
 
         return F.normalize(aggregated.transpose(-2, -3).reshape(B, Q, -1), dim=-1, p=2)
+
+
+class ECA(nn.Module):
+    """Efficient Channel Attention block."""
+
+    def __init__(self, c1: int, c2: int | None = None):
+        """Initialize ECA with an adaptive 1D kernel over channel descriptors."""
+        super().__init__()
+        channels = int(c1 if c2 is None else c2)
+        k = int(abs((math.log2(max(channels, 1)) + 1) / 2))
+        k = k if k % 2 else k + 1
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv = nn.Conv1d(1, 1, k, padding=k // 2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Reweight channels using local cross-channel interaction."""
+        y = self.avg_pool(x)
+        y = self.conv(y.squeeze(-1).transpose(-1, -2))
+        y = y.transpose(-1, -2).unsqueeze(-1)
+        return x * self.sigmoid(y)
