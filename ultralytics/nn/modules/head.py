@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy
 import math
+import os
 
 import torch
 import torch.nn as nn
@@ -33,6 +34,85 @@ __all__ = (
     "YOLOESegment",
     "v10Detect",
 )
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    """Read a boolean feature toggle from the environment."""
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_float(name: str, default: float) -> float:
+    """Read a float hyperparameter from the environment."""
+    try:
+        return float(os.getenv(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _parse_quality_level_mask(levels: str, nl: int) -> list[bool]:
+    """Parse the configured quality-head levels into a per-layer enable mask."""
+    text = str(levels or "p3p4").strip().lower()
+    if text in {"all", "p3,p4,p5", "p3p4p5"}:
+        return [True] * nl
+    if text in {"p3p4", "p3,p4", "0,1"}:
+        return [i < min(2, nl) for i in range(nl)]
+
+    indices = set()
+    for token in text.replace(";", ",").split(","):
+        token = token.strip().lower()
+        if not token:
+            continue
+        if token.startswith("p") and token[1:].isdigit():
+            idx = int(token[1:]) - 3
+        elif token.isdigit():
+            idx = int(token)
+        else:
+            continue
+        if 0 <= idx < nl:
+            indices.add(idx)
+    if not indices:
+        return [i < min(2, nl) for i in range(nl)]
+    return [i in indices for i in range(nl)]
+
+
+class _DLQRefineBlock(nn.Module):
+    """Lightweight drill-pipe-aware feature refinement block for low-height localization cues."""
+
+    def __init__(self, channels: int):
+        super().__init__()
+        self.local_branch = DWConv(channels, channels, 3)
+        self.strip_h = DWConv(channels, channels, (1, 5))
+        self.strip_v = DWConv(channels, channels, (5, 1))
+        self.fuse = Conv(channels * 3, channels, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Refine the input feature by combining local detail and slender continuity cues."""
+        f_local = self.local_branch(x)
+        f_slender = self.strip_h(x) + self.strip_v(x)
+        f_refined = self.fuse(torch.cat((x, f_local, f_slender), 1))
+        return x + f_refined
+
+
+class _DLQQualityHead(nn.Module):
+    """IoU-aware quality predictor operating on refined detection features."""
+
+    def __init__(self, channels: int):
+        super().__init__()
+        hidden = max(16, channels // 4)
+        self.conv = Conv(channels, hidden, 3)
+        self.pred = nn.Conv2d(hidden, 1, 1)
+        self.act = nn.Sigmoid()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Predict per-location localization quality in [0, 1]."""
+        return self.act(self.pred(self.conv(x)))
+
+    def bias_init(self) -> None:
+        """Initialize the final quality bias to zero."""
+        self.pred.bias.data.zero_()
 
 
 class _CenterContextGate(nn.Module):
@@ -153,6 +233,31 @@ class Detect(nn.Module):
                 for x in ch
             )
         )
+        plain_quality_enable = _env_bool("ULTRALYTICS_QUALITY_HEAD_ENABLE", False) and not self.end2end
+        self.dlq_head_enable = _env_bool("ULTRALYTICS_DLQ_HEAD_ENABLE", False) and not self.end2end
+        self.quality_head_variant = "dlq" if self.dlq_head_enable else ("plain" if plain_quality_enable else "none")
+        self.quality_head_enable = self.quality_head_variant != "none"
+        default_levels = "p3p4" if self.dlq_head_enable else "p3p4"
+        levels_env = "ULTRALYTICS_DLQ_HEAD_LEVELS" if self.dlq_head_enable else "ULTRALYTICS_QUALITY_HEAD_LEVELS"
+        score_env = "ULTRALYTICS_DLQ_HEAD_SCORE_MODE" if self.dlq_head_enable else "ULTRALYTICS_QUALITY_HEAD_SCORE_MODE"
+        alpha_env = "ULTRALYTICS_DLQ_HEAD_ALPHA" if self.dlq_head_enable else "ULTRALYTICS_QUALITY_HEAD_ALPHA"
+        self.quality_head_levels = os.getenv(levels_env, os.getenv("ULTRALYTICS_QUALITY_HEAD_LEVELS", default_levels))
+        self.quality_level_mask = _parse_quality_level_mask(self.quality_head_levels, self.nl)
+        self.quality_score_mode = os.getenv(
+            score_env, "mul" if self.dlq_head_enable else os.getenv("ULTRALYTICS_QUALITY_HEAD_SCORE_MODE", "sqrt")
+        ).strip().lower()
+        self.quality_alpha = _env_float(alpha_env, _env_float("ULTRALYTICS_QUALITY_HEAD_ALPHA", 0.6))
+        if self.quality_head_enable:
+            if self.quality_head_variant == "dlq":
+                self.dlq_refine = nn.ModuleList(
+                    _DLQRefineBlock(x) if self.quality_level_mask[i] else nn.Identity() for i, x in enumerate(ch)
+                )
+                self.cvq = nn.ModuleList(_DLQQualityHead(x) for x in ch)
+            else:
+                self.cvq = nn.ModuleList(
+                    nn.Sequential(Conv(x, max(16, x // 4), 3), nn.Conv2d(max(16, x // 4), 1, 1), nn.Sigmoid())
+                    for x in ch
+                )
         self.dfl = DFL(self.reg_max) if self.reg_max > 1 else nn.Identity()
 
         if self.end2end:
@@ -164,12 +269,20 @@ class Detect(nn.Module):
         if self.end2end:
             return self.forward_end2end(x)
 
+        quality = [] if self.quality_head_enable else None
         for i in range(self.nl):
-            x[i] = torch.cat((self.cv2[i](x[i]), self.cv3[i](x[i])), 1)
+            feat = x[i]
+            if self.quality_head_variant == "dlq" and self.quality_level_mask[i]:
+                feat = self.dlq_refine[i](feat)
+            if quality is not None:
+                quality.append(self.cvq[i](feat) if self.quality_level_mask[i] else None)
+            x[i] = torch.cat((self.cv2[i](feat), self.cv3[i](feat)), 1)
         if self.training:  # Training path
-            return x
-        y = self._inference(x)
-        return y if self.export else (y, x)
+            return {"main": x, "quality": quality} if self.quality_head_enable else x
+        y = self._inference(x, quality)
+        if self.export:
+            return y
+        return (y, {"main": x, "quality": quality}) if self.quality_head_enable else (y, x)
 
     def forward_end2end(self, x: list[torch.Tensor]) -> dict | tuple:
         """Perform forward pass of the v10Detect module.
@@ -194,7 +307,7 @@ class Detect(nn.Module):
         y = self.postprocess(y.permute(0, 2, 1), self.max_det, self.nc)
         return y if self.export else (y, {"one2many": x, "one2one": one2one})
 
-    def _inference(self, x: list[torch.Tensor]) -> torch.Tensor:
+    def _inference(self, x: list[torch.Tensor], quality: list[torch.Tensor | None] | None = None) -> torch.Tensor:
         """Decode predicted bounding boxes and class probabilities based on multiple-level feature maps.
 
         Args:
@@ -212,7 +325,26 @@ class Detect(nn.Module):
 
         box, cls = x_cat.split((self.reg_max * 4, self.nc), 1)
         dbox = self.decode_bboxes(self.dfl(box), self.anchors.unsqueeze(0)) * self.strides
-        return torch.cat((dbox, cls.sigmoid()), 1)
+        cls = cls.sigmoid()
+        if self.quality_head_enable and quality is not None:
+            quality_cat = []
+            for xi, qi in zip(x, quality):
+                if qi is None:
+                    qi = torch.ones((shape[0], 1, xi.shape[2], xi.shape[3]), device=xi.device, dtype=xi.dtype)
+                quality_cat.append(qi.view(shape[0], 1, -1))
+            cls = self._fuse_quality_scores(cls, torch.cat(quality_cat, 2))
+        return torch.cat((dbox, cls), 1)
+
+    def _fuse_quality_scores(self, cls_scores: torch.Tensor, quality_scores: torch.Tensor) -> torch.Tensor:
+        """Fuse classification confidence with predicted localization quality before NMS."""
+        cls_scores = cls_scores.clamp(0, 1)
+        quality_scores = quality_scores.clamp(0, 1)
+        if self.quality_head_variant == "dlq" or self.quality_score_mode in {"mul", "prod", "product"}:
+            return (cls_scores * quality_scores).clamp_(0.0, 1.0)
+        if self.quality_score_mode in {"pow", "power", "alpha"}:
+            alpha = min(max(float(self.quality_alpha), 0.0), 1.0)
+            return cls_scores.pow(alpha) * quality_scores.pow(1.0 - alpha)
+        return (cls_scores * quality_scores).clamp_min(0.0).sqrt()
 
     def bias_init(self):
         """Initialize Detect() biases, WARNING: requires stride availability."""
@@ -222,6 +354,12 @@ class Detect(nn.Module):
         for a, b, s in zip(m.cv2, m.cv3, m.stride):  # from
             a[-1].bias.data[:] = 1.0  # box
             b[-1].bias.data[: m.nc] = math.log(5 / m.nc / (640 / s) ** 2)  # cls (.01 objects, 80 classes, 640 img)
+        if self.quality_head_enable:
+            for q in m.cvq:
+                if hasattr(q, "bias_init"):
+                    q.bias_init()
+                else:
+                    q[-2].bias.data.zero_()
         if self.end2end:
             for a, b, s in zip(m.one2one_cv2, m.one2one_cv3, m.stride):  # from
                 a[-1].bias.data[:] = 1.0  # box

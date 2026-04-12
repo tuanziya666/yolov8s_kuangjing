@@ -208,7 +208,14 @@ class DetectionTrainer(BaseTrainer):
 
     def get_validator(self):
         """Return a DetectionValidator for YOLO model validation."""
-        self.loss_names = "box_loss", "cls_loss", "dfl_loss"
+        model = unwrap_model(self.model) if isinstance(self.model, nn.Module) else None
+        detect_head = model.model[-1] if model is not None and hasattr(model, "model") else None
+        quality_enabled = bool(getattr(detect_head, "quality_head_enable", False))
+        self.loss_names = ("box_loss", "cls_loss", "dfl_loss", "quality_loss") if quality_enabled else (
+            "box_loss",
+            "cls_loss",
+            "dfl_loss",
+        )
         return yolo.detect.DetectionValidator(
             self.test_loader, save_dir=self.save_dir, args=copy(self.args), _callbacks=self.callbacks
         )
@@ -252,6 +259,8 @@ class DetectionTrainer(BaseTrainer):
         bbox_loss = getattr(criterion, "bbox_loss", None) if criterion is not None else None
         if bbox_loss is not None and hasattr(bbox_loss, "get_sample_aware_metrics"):
             metrics.update(bbox_loss.get_sample_aware_metrics(reset=True))
+            if hasattr(criterion, "get_quality_metrics"):
+                metrics.update(criterion.get_quality_metrics(reset=True))
             if hasattr(criterion, "aux_head_enable") and criterion.aux_head_enable:
                 metrics["aux/last_positive"] = float(getattr(criterion, "aux_last_positive", 0))
             return metrics
@@ -261,6 +270,14 @@ class DetectionTrainer(BaseTrainer):
             sa_enabled = os.getenv("ULTRALYTICS_SA_BOX_ENABLE", "").strip().lower() in {"1", "true", "yes", "on"}
         tal_enabled = os.getenv("ULTRALYTICS_TAL_REG_ENABLE", "").strip().lower() in {"1", "true", "yes", "on"}
         aux_enabled = os.getenv("ULTRALYTICS_AUX_HEAD_ENABLE", "").strip().lower() in {"1", "true", "yes", "on"}
+        quality_enabled = (
+            os.getenv("ULTRALYTICS_QUALITY_HEAD_ENABLE", "").strip().lower() in {"1", "true", "yes", "on"}
+            or os.getenv("ULTRALYTICS_DLQ_HEAD_ENABLE", "").strip().lower() in {"1", "true", "yes", "on"}
+        )
+        drill_quality_enabled = (
+            os.getenv("ULTRALYTICS_QUALITY_HEAD_DRILL_WEIGHT_ENABLE", "").strip().lower() in {"1", "true", "yes", "on"}
+            or os.getenv("ULTRALYTICS_DLQ_HEAD_DRILL_WEIGHT_ENABLE", "").strip().lower() in {"1", "true", "yes", "on"}
+        )
         if sa_enabled:
             metrics.update(
                 {
@@ -284,6 +301,18 @@ class DetectionTrainer(BaseTrainer):
             )
         if aux_enabled:
             metrics["aux/last_positive"] = 0.0
+        if quality_enabled:
+            metrics.update(
+                {
+                    "quality/mean_q_pred": 0.0,
+                    "quality/mean_q_target": 0.0,
+                    "quality/loss_q": 0.0,
+                    "quality/num_positive": 0.0,
+                }
+            )
+            if drill_quality_enabled:
+                metrics["quality/num_drill_positive"] = 0.0
+                metrics["quality/num_small_drill_positive"] = 0.0
         return metrics
 
     def progress_string(self):

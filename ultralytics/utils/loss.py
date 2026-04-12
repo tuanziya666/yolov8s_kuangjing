@@ -58,6 +58,58 @@ def _env_int_list(name: str, default: list[int]) -> list[int]:
     return out or list(default)
 
 
+def _env_first_str(names: list[str], default: str) -> str:
+    """Read the first available lowercase string value from multiple environment keys."""
+    for name in names:
+        value = os.getenv(name)
+        if value is not None:
+            return str(value).strip().lower()
+    return default
+
+
+def _env_first_float(names: list[str], default: float) -> float:
+    """Read the first available float value from multiple environment keys."""
+    for name in names:
+        value = os.getenv(name)
+        if value is None:
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return default
+
+
+def _env_first_bool(names: list[str], default: bool = False) -> bool:
+    """Read the first available boolean value from multiple environment keys."""
+    for name in names:
+        value = os.getenv(name)
+        if value is None:
+            continue
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+    return default
+
+
+def _env_first_int_list(names: list[str], default: list[int]) -> list[int]:
+    """Read the first available integer-list value from multiple environment keys."""
+    for name in names:
+        value = os.getenv(name)
+        if value is None:
+            continue
+        out = []
+        for token in str(value).replace(";", ",").split(","):
+            token = token.strip()
+            if not token:
+                continue
+            try:
+                out.append(int(token))
+            except ValueError:
+                continue
+        if out:
+            return out
+    return list(default)
+
+
 class VarifocalLoss(nn.Module):
     """Varifocal loss by Zhang et al.
 
@@ -927,23 +979,64 @@ class v8DetectionLoss:
                 f"(gain={self.aux_head_gain:.3f}, small_thr={self.aux_small_area_thr:.6f}, "
                 f"target_cls={self.aux_target_class_ids})."
             )
-        self.quality_head_enable = bool(getattr(m, "quality_head_enable", _env_bool("ULTRALYTICS_QUALITY_HEAD_ENABLE", False)))
-        self.quality_head_levels = getattr(m, "quality_head_levels", os.getenv("ULTRALYTICS_QUALITY_HEAD_LEVELS", "p3p4"))
-        self.quality_lambda = _env_float("ULTRALYTICS_QUALITY_HEAD_LAMBDA", 0.2)
-        self.quality_score_mode = getattr(m, "quality_score_mode", os.getenv("ULTRALYTICS_QUALITY_HEAD_SCORE_MODE", "sqrt"))
-        self.quality_alpha = getattr(m, "quality_alpha", _env_float("ULTRALYTICS_QUALITY_HEAD_ALPHA", 0.6))
-        self.use_drill_quality_weight = _env_bool("ULTRALYTICS_QUALITY_HEAD_DRILL_WEIGHT_ENABLE", False)
-        self.drill_quality_refine = _env_bool("ULTRALYTICS_QUALITY_HEAD_DRILL_WEIGHT_REFINE", False)
-        self.drill_quality_target_class_ids = _env_int_list("ULTRALYTICS_QUALITY_HEAD_TARGET_CLASS_IDS", [2])
-        self.drill_quality_base_weight = _env_float("ULTRALYTICS_QUALITY_HEAD_DRILL_BASE_WEIGHT", 1.2)
-        self.drill_quality_small_h1 = _env_float("ULTRALYTICS_QUALITY_HEAD_SMALL_H1", 0.06)
-        self.drill_quality_small_h2 = _env_float("ULTRALYTICS_QUALITY_HEAD_SMALL_H2", 0.09)
-        self.drill_quality_small_w1 = _env_float("ULTRALYTICS_QUALITY_HEAD_DRILL_SMALL_W1", 1.3)
-        self.drill_quality_small_w2 = _env_float("ULTRALYTICS_QUALITY_HEAD_DRILL_SMALL_W2", 1.15)
+        dlq_env_enable = _env_bool("ULTRALYTICS_DLQ_HEAD_ENABLE", False)
+        quality_env_enable = _env_bool("ULTRALYTICS_QUALITY_HEAD_ENABLE", False)
+        self.quality_head_variant = getattr(
+            m,
+            "quality_head_variant",
+            "dlq" if dlq_env_enable else ("plain" if quality_env_enable else "none"),
+        )
+        self.quality_head_enable = bool(getattr(m, "quality_head_enable", dlq_env_enable or quality_env_enable))
+        self.quality_head_levels = getattr(
+            m,
+            "quality_head_levels",
+            _env_first_str(["ULTRALYTICS_DLQ_HEAD_LEVELS", "ULTRALYTICS_QUALITY_HEAD_LEVELS"], "p3p4"),
+        )
+        self.quality_lambda = _env_first_float(["ULTRALYTICS_DLQ_HEAD_LAMBDA", "ULTRALYTICS_QUALITY_HEAD_LAMBDA"], 0.2)
+        default_score_mode = "mul" if self.quality_head_variant == "dlq" else "sqrt"
+        self.quality_score_mode = getattr(
+            m,
+            "quality_score_mode",
+            _env_first_str(["ULTRALYTICS_DLQ_HEAD_SCORE_MODE", "ULTRALYTICS_QUALITY_HEAD_SCORE_MODE"], default_score_mode),
+        )
+        self.quality_alpha = getattr(
+            m,
+            "quality_alpha",
+            _env_first_float(["ULTRALYTICS_DLQ_HEAD_ALPHA", "ULTRALYTICS_QUALITY_HEAD_ALPHA"], 0.6),
+        )
+        self.use_drill_quality_weight = _env_first_bool(
+            ["ULTRALYTICS_DLQ_HEAD_DRILL_WEIGHT_ENABLE", "ULTRALYTICS_QUALITY_HEAD_DRILL_WEIGHT_ENABLE"], False
+        )
+        self.drill_quality_refine = _env_first_bool(
+            ["ULTRALYTICS_DLQ_HEAD_DRILL_WEIGHT_REFINE", "ULTRALYTICS_QUALITY_HEAD_DRILL_WEIGHT_REFINE"], False
+        )
+        self.drill_quality_target_class_ids = _env_first_int_list(
+            ["ULTRALYTICS_DLQ_HEAD_TARGET_CLASS_IDS", "ULTRALYTICS_QUALITY_HEAD_TARGET_CLASS_IDS"], [2]
+        )
+        self.drill_quality_base_weight = _env_first_float(
+            ["ULTRALYTICS_DLQ_HEAD_DRILL_BASE_WEIGHT", "ULTRALYTICS_QUALITY_HEAD_DRILL_BASE_WEIGHT"], 1.2
+        )
+        self.drill_quality_small_h1 = _env_first_float(
+            ["ULTRALYTICS_DLQ_HEAD_SMALL_H1", "ULTRALYTICS_QUALITY_HEAD_SMALL_H1"], 0.06
+        )
+        self.drill_quality_small_h2 = _env_first_float(
+            ["ULTRALYTICS_DLQ_HEAD_SMALL_H2", "ULTRALYTICS_QUALITY_HEAD_SMALL_H2"], 0.09
+        )
+        self.drill_quality_small_w1 = _env_first_float(
+            ["ULTRALYTICS_DLQ_HEAD_DRILL_SMALL_W1", "ULTRALYTICS_QUALITY_HEAD_DRILL_SMALL_W1"], 1.3
+        )
+        self.drill_quality_small_w2 = _env_first_float(
+            ["ULTRALYTICS_DLQ_HEAD_DRILL_SMALL_W2", "ULTRALYTICS_QUALITY_HEAD_DRILL_SMALL_W2"], 1.15
+        )
         self._reset_quality_stats()
         if self.quality_head_enable:
+            head_name = (
+                "Drill-pipe Localization Quality Calibration Head (DLQ-Head)"
+                if self.quality_head_variant == "dlq"
+                else "IoU-aware quality head"
+            )
             LOGGER.info(
-                "Using IoU-aware quality head "
+                f"Using {head_name} "
                 f"(levels={self.quality_head_levels}, lambda_q={self.quality_lambda:.3f}, "
                 f"score_mode={self.quality_score_mode}, alpha={self.quality_alpha:.3f})."
             )
@@ -1044,8 +1137,10 @@ class v8DetectionLoss:
 
         quality_weight = torch.ones_like(heights)
         if self.drill_quality_refine:
+            quality_weight[is_drill_positive] = self.drill_quality_base_weight
             quality_weight[is_small_drill_positive] = self.drill_quality_small_w1
-            quality_weight[is_mid_drill_positive] = self.drill_quality_small_w2
+            if self.quality_head_variant != "dlq":
+                quality_weight[is_mid_drill_positive] = self.drill_quality_small_w2
         else:
             quality_weight[is_drill_positive] = self.drill_quality_base_weight
 
