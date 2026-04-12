@@ -400,6 +400,12 @@ def get_flops(model, imgsz=640):
     Returns:
         (float): The model FLOPs in billions.
     """
+    # thop profiling is unreliable for torchvision DeformConv2d-based DCNv3 experiments on some Windows setups.
+    # Skip FLOPs estimation so model initialization can proceed to training.
+    deform_like = {"DCNv2Conv", "BottleneckDCNv2", "C2fDCNv2", "DCNv3Conv", "BottleneckDCNv3", "C2fDCNv3", "DeformConv2d"}
+    if any(type(m).__name__ in deform_like for m in model.modules()):
+        return 0.0
+
     try:
         import thop
     except ImportError:

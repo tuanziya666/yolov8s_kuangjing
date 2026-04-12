@@ -52,6 +52,7 @@ __all__ = (
     "ASFF2",
     "CARAFE",
     "CSPStage",
+    "C2fDCNv2",
     "C2fDCNv3",
     "CoordAtt",
     "ECA",
@@ -931,6 +932,70 @@ class DCNv3Conv(nn.Module):
         offset, mask = torch.split(offset_mask, [2 * k2, k2], dim=1)
         x = self.dcn(x, offset, mask.sigmoid())
         return self.act(self.bn(x))
+
+
+class DCNv2Conv(nn.Module):
+    """Modulated deformable convolution block backed by torchvision DeformConv2d."""
+
+    def __init__(self, c1: int, c2: int, k: int = 3, s: int = 1, g: int = 1, d: int = 1, act: bool = True):
+        """Initialize the DCNv2-style convolution block."""
+        super().__init__()
+        try:
+            from torchvision.ops import DeformConv2d
+        except Exception as e:  # pragma: no cover - depends on torchvision build
+            raise ImportError("torchvision.ops.DeformConv2d is required for DCNv2 experiments.") from e
+
+        self.align = Conv(c1, c2, 1, 1, act=False) if c1 != c2 else nn.Identity()
+        self.offset_mask = nn.Conv2d(c2, 3 * k * k, kernel_size=k, stride=s, padding=autopad(k, None, d), dilation=d)
+        self.dcn = DeformConv2d(c2, c2, kernel_size=k, stride=s, padding=autopad(k, None, d), dilation=d, groups=g, bias=False)
+        self.bn = nn.BatchNorm2d(c2)
+        self.act = Conv.default_act if act is True else act if isinstance(act, nn.Module) else nn.Identity()
+        nn.init.zeros_(self.offset_mask.weight)
+        nn.init.zeros_(self.offset_mask.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply modulated deformable convolution with learned offsets and masks."""
+        x = self.align(x)
+        offset_mask = self.offset_mask(x)
+        k2 = self.dcn.kernel_size[0] * self.dcn.kernel_size[1]
+        offset, mask = torch.split(offset_mask, [2 * k2, k2], dim=1)
+        x = self.dcn(x, offset, mask.sigmoid())
+        return self.act(self.bn(x))
+
+
+class BottleneckDCNv2(nn.Module):
+    """Bottleneck block with DCNv2-style spatial mixing."""
+
+    def __init__(self, c1: int, c2: int, shortcut: bool = True, g: int = 1, e: float = 1.0):
+        """Initialize the DCNv2 bottleneck."""
+        super().__init__()
+        hidden = int(c2 * e)
+        self.cv1 = Conv(c1, hidden, 1, 1)
+        self.cv2 = DCNv2Conv(hidden, c2, 3, 1, g=g)
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the DCNv2 bottleneck with optional residual connection."""
+        out = self.cv2(self.cv1(x))
+        return x + out if self.add else out
+
+
+class C2fDCNv2(nn.Module):
+    """C2f block with DCNv2-style bottlenecks."""
+
+    def __init__(self, c1: int, c2: int, n: int = 1, shortcut: bool = False, g: int = 1, e: float = 0.5):
+        """Initialize the C2fDCNv2 block."""
+        super().__init__()
+        self.c = int(c2 * e)
+        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
+        self.cv2 = Conv((2 + n) * self.c, c2, 1, 1)
+        self.m = nn.ModuleList(BottleneckDCNv2(self.c, self.c, shortcut, g, e=1.0) for _ in range(n))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass through C2fDCNv2."""
+        y = list(self.cv1(x).chunk(2, 1))
+        y.extend(m(y[-1]) for m in self.m)
+        return self.cv2(torch.cat(y, 1))
 
 
 class BottleneckDCNv3(nn.Module):

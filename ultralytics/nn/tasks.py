@@ -35,6 +35,7 @@ from ultralytics.nn.modules import (
     C2fGC,
     C2fAttn,
     C2fCIB,
+    C2fDCNv2,
     C2fDCNv3,
     C2fPSA,
     C3Ghost,
@@ -1596,6 +1597,7 @@ def parse_model(d, ch, verbose=True):
             ResidualLDCM,
             SPDConv,
             StripPooling,
+            C2fDCNv2,
             C2fDCNv3,
         }
     )
@@ -1618,6 +1620,7 @@ def parse_model(d, ch, verbose=True):
             C2PSA,
             A2C2f,
             CSPStage,
+            C2fDCNv2,
             C2fDCNv3,
         }
     )
