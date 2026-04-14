@@ -96,6 +96,49 @@ class _DLQRefineBlock(nn.Module):
         return x + f_refined
 
 
+class _DLRRefineBlock(nn.Module):
+    """Regression-only refinement block for low-height slender-object localization."""
+
+    def __init__(self, channels: int):
+        super().__init__()
+        self.local_branch = DWConv(channels, channels, 3)
+        self.strip_h = DWConv(channels, channels, (1, 5))
+        self.strip_v = DWConv(channels, channels, (5, 1))
+        self.edge_pool = nn.AvgPool2d(kernel_size=3, stride=1, padding=1)
+        self.fuse = Conv(channels * 4, channels, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Enhance boundary and slender continuity cues for the regression branch only."""
+        f_local = self.local_branch(x)
+        f_slender = self.strip_h(x) + self.strip_v(x)
+        f_edge = x - self.edge_pool(x)
+        f_refined = self.fuse(torch.cat((x, f_local, f_slender, f_edge), 1))
+        return x + f_refined
+
+
+class _DGLRRefineBlock(nn.Module):
+    """Glare-aware regression-only refinement block for low-height drill_pipe localization."""
+
+    def __init__(self, channels: int):
+        super().__init__()
+        self.local_branch = DWConv(channels, channels, 3)
+        self.strip_h = DWConv(channels, channels, (1, 5))
+        self.strip_v = DWConv(channels, channels, (5, 1))
+        self.glare_pool = nn.AvgPool2d(kernel_size=5, stride=1, padding=2)
+        self.contrast_branch = DWConv(channels, channels, 3)
+        self.fuse = Conv(channels * 4, channels, 1)
+        self.gate = nn.Sequential(nn.Conv2d(channels * 2, channels, 1, bias=True), nn.Sigmoid())
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Enhance slender local boundaries while suppressing smooth glare-heavy regions."""
+        f_local = self.local_branch(x)
+        f_slender = self.strip_h(x) + self.strip_v(x)
+        f_contrast = self.contrast_branch(x - self.glare_pool(x))
+        gate = self.gate(torch.cat((f_slender, f_contrast), 1))
+        f_refined = self.fuse(torch.cat((x, f_local, f_slender, f_contrast), 1))
+        return x + gate * f_refined
+
+
 class _DLQQualityHead(nn.Module):
     """IoU-aware quality predictor operating on refined detection features."""
 
@@ -234,23 +277,59 @@ class Detect(nn.Module):
             )
         )
         plain_quality_enable = _env_bool("ULTRALYTICS_QUALITY_HEAD_ENABLE", False) and not self.end2end
+        self.dglr_head_enable = _env_bool("ULTRALYTICS_DGLR_HEAD_ENABLE", False) and not self.end2end
         self.dlq_head_enable = _env_bool("ULTRALYTICS_DLQ_HEAD_ENABLE", False) and not self.end2end
-        self.quality_head_variant = "dlq" if self.dlq_head_enable else ("plain" if plain_quality_enable else "none")
+        self.dlr_head_enable = _env_bool("ULTRALYTICS_DLR_HEAD_ENABLE", False) and not self.end2end
+        self.quality_head_variant = (
+            "dglr"
+            if self.dglr_head_enable
+            else (
+                "dlr"
+            if self.dlr_head_enable
+                else ("dlq" if self.dlq_head_enable else ("plain" if plain_quality_enable else "none"))
+            )
+        )
         self.quality_head_enable = self.quality_head_variant != "none"
-        default_levels = "p3p4" if self.dlq_head_enable else "p3p4"
-        levels_env = "ULTRALYTICS_DLQ_HEAD_LEVELS" if self.dlq_head_enable else "ULTRALYTICS_QUALITY_HEAD_LEVELS"
-        score_env = "ULTRALYTICS_DLQ_HEAD_SCORE_MODE" if self.dlq_head_enable else "ULTRALYTICS_QUALITY_HEAD_SCORE_MODE"
-        alpha_env = "ULTRALYTICS_DLQ_HEAD_ALPHA" if self.dlq_head_enable else "ULTRALYTICS_QUALITY_HEAD_ALPHA"
+        default_levels = "p3p4"
+        if self.dglr_head_enable:
+            levels_env = "ULTRALYTICS_DGLR_HEAD_LEVELS"
+            score_env = "ULTRALYTICS_DGLR_HEAD_SCORE_MODE"
+            alpha_env = "ULTRALYTICS_DGLR_HEAD_ALPHA"
+        elif self.dlr_head_enable:
+            levels_env = "ULTRALYTICS_DLR_HEAD_LEVELS"
+            score_env = "ULTRALYTICS_DLR_HEAD_SCORE_MODE"
+            alpha_env = "ULTRALYTICS_DLR_HEAD_ALPHA"
+        elif self.dlq_head_enable:
+            levels_env = "ULTRALYTICS_DLQ_HEAD_LEVELS"
+            score_env = "ULTRALYTICS_DLQ_HEAD_SCORE_MODE"
+            alpha_env = "ULTRALYTICS_DLQ_HEAD_ALPHA"
+        else:
+            levels_env = "ULTRALYTICS_QUALITY_HEAD_LEVELS"
+            score_env = "ULTRALYTICS_QUALITY_HEAD_SCORE_MODE"
+            alpha_env = "ULTRALYTICS_QUALITY_HEAD_ALPHA"
         self.quality_head_levels = os.getenv(levels_env, os.getenv("ULTRALYTICS_QUALITY_HEAD_LEVELS", default_levels))
         self.quality_level_mask = _parse_quality_level_mask(self.quality_head_levels, self.nl)
         self.quality_score_mode = os.getenv(
-            score_env, "mul" if self.dlq_head_enable else os.getenv("ULTRALYTICS_QUALITY_HEAD_SCORE_MODE", "sqrt")
+            score_env,
+            "mul"
+            if self.quality_head_variant in {"dlq", "dlr", "dglr"}
+            else os.getenv("ULTRALYTICS_QUALITY_HEAD_SCORE_MODE", "sqrt"),
         ).strip().lower()
         self.quality_alpha = _env_float(alpha_env, _env_float("ULTRALYTICS_QUALITY_HEAD_ALPHA", 0.6))
         if self.quality_head_enable:
             if self.quality_head_variant == "dlq":
                 self.dlq_refine = nn.ModuleList(
                     _DLQRefineBlock(x) if self.quality_level_mask[i] else nn.Identity() for i, x in enumerate(ch)
+                )
+                self.cvq = nn.ModuleList(_DLQQualityHead(x) for x in ch)
+            elif self.quality_head_variant == "dglr":
+                self.dglr_refine = nn.ModuleList(
+                    _DGLRRefineBlock(x) if self.quality_level_mask[i] else nn.Identity() for i, x in enumerate(ch)
+                )
+                self.cvq = nn.ModuleList(_DLQQualityHead(x) for x in ch)
+            elif self.quality_head_variant == "dlr":
+                self.dlr_refine = nn.ModuleList(
+                    _DLRRefineBlock(x) if self.quality_level_mask[i] else nn.Identity() for i, x in enumerate(ch)
                 )
                 self.cvq = nn.ModuleList(_DLQQualityHead(x) for x in ch)
             else:
@@ -266,17 +345,23 @@ class Detect(nn.Module):
 
     def forward(self, x: list[torch.Tensor]) -> list[torch.Tensor] | tuple:
         """Concatenate and return predicted bounding boxes and class probabilities."""
+        self._ensure_quality_attrs()
         if self.end2end:
             return self.forward_end2end(x)
 
         quality = [] if self.quality_head_enable else None
         for i in range(self.nl):
-            feat = x[i]
+            cls_feat = x[i]
+            reg_feat = cls_feat
             if self.quality_head_variant == "dlq" and self.quality_level_mask[i]:
-                feat = self.dlq_refine[i](feat)
+                cls_feat = reg_feat = self.dlq_refine[i](cls_feat)
+            elif self.quality_head_variant == "dglr" and self.quality_level_mask[i]:
+                reg_feat = self.dglr_refine[i](cls_feat)
+            elif self.quality_head_variant == "dlr" and self.quality_level_mask[i]:
+                reg_feat = self.dlr_refine[i](cls_feat)
             if quality is not None:
-                quality.append(self.cvq[i](feat) if self.quality_level_mask[i] else None)
-            x[i] = torch.cat((self.cv2[i](feat), self.cv3[i](feat)), 1)
+                quality.append(self.cvq[i](reg_feat) if self.quality_level_mask[i] else None)
+            x[i] = torch.cat((self.cv2[i](reg_feat), self.cv3[i](cls_feat)), 1)
         if self.training:  # Training path
             return {"main": x, "quality": quality} if self.quality_head_enable else x
         y = self._inference(x, quality)
@@ -316,6 +401,7 @@ class Detect(nn.Module):
         Returns:
             (torch.Tensor): Concatenated tensor of decoded bounding boxes and class probabilities.
         """
+        self._ensure_quality_attrs()
         # Inference path
         shape = x[0].shape  # BCHW
         x_cat = torch.cat([xi.view(shape[0], self.no, -1) for xi in x], 2)
@@ -339,15 +425,16 @@ class Detect(nn.Module):
         """Fuse classification confidence with predicted localization quality before NMS."""
         cls_scores = cls_scores.clamp(0, 1)
         quality_scores = quality_scores.clamp(0, 1)
-        if self.quality_head_variant == "dlq" or self.quality_score_mode in {"mul", "prod", "product"}:
-            return (cls_scores * quality_scores).clamp_(0.0, 1.0)
         if self.quality_score_mode in {"pow", "power", "alpha"}:
             alpha = min(max(float(self.quality_alpha), 0.0), 1.0)
             return cls_scores.pow(alpha) * quality_scores.pow(1.0 - alpha)
+        if self.quality_score_mode in {"mul", "prod", "product"} or self.quality_head_variant in {"dlq", "dlr", "dglr"}:
+            return (cls_scores * quality_scores).clamp_(0.0, 1.0)
         return (cls_scores * quality_scores).clamp_min(0.0).sqrt()
 
     def bias_init(self):
         """Initialize Detect() biases, WARNING: requires stride availability."""
+        self._ensure_quality_attrs()
         m = self  # self.model[-1]  # Detect() module
         # cf = torch.bincount(torch.tensor(np.concatenate(dataset.labels, 0)[:, 0]).long(), minlength=nc) + 1
         # ncf = math.log(0.6 / (m.nc - 0.999999)) if cf is None else torch.log(cf / cf.sum())  # nominal class frequency
@@ -373,6 +460,20 @@ class Detect(nn.Module):
             xywh=xywh and not self.end2end and not self.xyxy,
             dim=1,
         )
+
+    def _ensure_quality_attrs(self) -> None:
+        """Backfill quality-head attributes for checkpoints saved before these fields existed."""
+        if hasattr(self, "quality_head_enable"):
+            return
+        self.dglr_head_enable = False
+        self.dlr_head_enable = False
+        self.dlq_head_enable = False
+        self.quality_head_variant = "none"
+        self.quality_head_enable = False
+        self.quality_head_levels = "p3p4"
+        self.quality_level_mask = [False] * getattr(self, "nl", 0)
+        self.quality_score_mode = "sqrt"
+        self.quality_alpha = 0.6
 
     @staticmethod
     def postprocess(preds: torch.Tensor, max_det: int, nc: int = 80) -> torch.Tensor:

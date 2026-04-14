@@ -979,61 +979,110 @@ class v8DetectionLoss:
                 f"(gain={self.aux_head_gain:.3f}, small_thr={self.aux_small_area_thr:.6f}, "
                 f"target_cls={self.aux_target_class_ids})."
             )
+        dglr_env_enable = _env_bool("ULTRALYTICS_DGLR_HEAD_ENABLE", False)
+        dlr_env_enable = _env_bool("ULTRALYTICS_DLR_HEAD_ENABLE", False)
         dlq_env_enable = _env_bool("ULTRALYTICS_DLQ_HEAD_ENABLE", False)
         quality_env_enable = _env_bool("ULTRALYTICS_QUALITY_HEAD_ENABLE", False)
         self.quality_head_variant = getattr(
             m,
             "quality_head_variant",
-            "dlq" if dlq_env_enable else ("plain" if quality_env_enable else "none"),
+            "dglr"
+            if dglr_env_enable
+            else ("dlr" if dlr_env_enable else ("dlq" if dlq_env_enable else ("plain" if quality_env_enable else "none"))),
         )
-        self.quality_head_enable = bool(getattr(m, "quality_head_enable", dlq_env_enable or quality_env_enable))
+        self.quality_head_enable = bool(
+            getattr(m, "quality_head_enable", dglr_env_enable or dlr_env_enable or dlq_env_enable or quality_env_enable)
+        )
         self.quality_head_levels = getattr(
             m,
             "quality_head_levels",
-            _env_first_str(["ULTRALYTICS_DLQ_HEAD_LEVELS", "ULTRALYTICS_QUALITY_HEAD_LEVELS"], "p3p4"),
+            _env_first_str(
+                ["ULTRALYTICS_DGLR_HEAD_LEVELS", "ULTRALYTICS_DLR_HEAD_LEVELS", "ULTRALYTICS_DLQ_HEAD_LEVELS", "ULTRALYTICS_QUALITY_HEAD_LEVELS"],
+                "p3p4",
+            ),
         )
-        self.quality_lambda = _env_first_float(["ULTRALYTICS_DLQ_HEAD_LAMBDA", "ULTRALYTICS_QUALITY_HEAD_LAMBDA"], 0.2)
-        default_score_mode = "mul" if self.quality_head_variant == "dlq" else "sqrt"
+        self.quality_lambda = _env_first_float(
+            ["ULTRALYTICS_DGLR_HEAD_LAMBDA", "ULTRALYTICS_DLR_HEAD_LAMBDA", "ULTRALYTICS_DLQ_HEAD_LAMBDA", "ULTRALYTICS_QUALITY_HEAD_LAMBDA"],
+            0.2,
+        )
+        default_score_mode = "mul" if self.quality_head_variant in {"dlq", "dlr", "dglr"} else "sqrt"
         self.quality_score_mode = getattr(
             m,
             "quality_score_mode",
-            _env_first_str(["ULTRALYTICS_DLQ_HEAD_SCORE_MODE", "ULTRALYTICS_QUALITY_HEAD_SCORE_MODE"], default_score_mode),
+            _env_first_str(
+                ["ULTRALYTICS_DGLR_HEAD_SCORE_MODE", "ULTRALYTICS_DLR_HEAD_SCORE_MODE", "ULTRALYTICS_DLQ_HEAD_SCORE_MODE", "ULTRALYTICS_QUALITY_HEAD_SCORE_MODE"],
+                default_score_mode,
+            ),
         )
         self.quality_alpha = getattr(
             m,
             "quality_alpha",
-            _env_first_float(["ULTRALYTICS_DLQ_HEAD_ALPHA", "ULTRALYTICS_QUALITY_HEAD_ALPHA"], 0.6),
+            _env_first_float(
+                ["ULTRALYTICS_DGLR_HEAD_ALPHA", "ULTRALYTICS_DLR_HEAD_ALPHA", "ULTRALYTICS_DLQ_HEAD_ALPHA", "ULTRALYTICS_QUALITY_HEAD_ALPHA"],
+                0.6,
+            ),
         )
         self.use_drill_quality_weight = _env_first_bool(
-            ["ULTRALYTICS_DLQ_HEAD_DRILL_WEIGHT_ENABLE", "ULTRALYTICS_QUALITY_HEAD_DRILL_WEIGHT_ENABLE"], False
+            [
+                "ULTRALYTICS_DGLR_HEAD_DRILL_WEIGHT_ENABLE",
+                "ULTRALYTICS_DLR_HEAD_DRILL_WEIGHT_ENABLE",
+                "ULTRALYTICS_DLQ_HEAD_DRILL_WEIGHT_ENABLE",
+                "ULTRALYTICS_QUALITY_HEAD_DRILL_WEIGHT_ENABLE",
+            ],
+            False,
         )
         self.drill_quality_refine = _env_first_bool(
-            ["ULTRALYTICS_DLQ_HEAD_DRILL_WEIGHT_REFINE", "ULTRALYTICS_QUALITY_HEAD_DRILL_WEIGHT_REFINE"], False
+            [
+                "ULTRALYTICS_DGLR_HEAD_DRILL_WEIGHT_REFINE",
+                "ULTRALYTICS_DLR_HEAD_DRILL_WEIGHT_REFINE",
+                "ULTRALYTICS_DLQ_HEAD_DRILL_WEIGHT_REFINE",
+                "ULTRALYTICS_QUALITY_HEAD_DRILL_WEIGHT_REFINE",
+            ],
+            False,
         )
         self.drill_quality_target_class_ids = _env_first_int_list(
-            ["ULTRALYTICS_DLQ_HEAD_TARGET_CLASS_IDS", "ULTRALYTICS_QUALITY_HEAD_TARGET_CLASS_IDS"], [2]
+            ["ULTRALYTICS_DGLR_HEAD_TARGET_CLASS_IDS", "ULTRALYTICS_DLR_HEAD_TARGET_CLASS_IDS", "ULTRALYTICS_DLQ_HEAD_TARGET_CLASS_IDS", "ULTRALYTICS_QUALITY_HEAD_TARGET_CLASS_IDS"], [2]
         )
         self.drill_quality_base_weight = _env_first_float(
-            ["ULTRALYTICS_DLQ_HEAD_DRILL_BASE_WEIGHT", "ULTRALYTICS_QUALITY_HEAD_DRILL_BASE_WEIGHT"], 1.2
+            ["ULTRALYTICS_DGLR_HEAD_DRILL_BASE_WEIGHT", "ULTRALYTICS_DLR_HEAD_DRILL_BASE_WEIGHT", "ULTRALYTICS_DLQ_HEAD_DRILL_BASE_WEIGHT", "ULTRALYTICS_QUALITY_HEAD_DRILL_BASE_WEIGHT"],
+            1.2,
         )
         self.drill_quality_small_h1 = _env_first_float(
-            ["ULTRALYTICS_DLQ_HEAD_SMALL_H1", "ULTRALYTICS_QUALITY_HEAD_SMALL_H1"], 0.06
+            ["ULTRALYTICS_DGLR_HEAD_SMALL_H1", "ULTRALYTICS_DLR_HEAD_SMALL_H1", "ULTRALYTICS_DLQ_HEAD_SMALL_H1", "ULTRALYTICS_QUALITY_HEAD_SMALL_H1"],
+            0.06,
         )
         self.drill_quality_small_h2 = _env_first_float(
-            ["ULTRALYTICS_DLQ_HEAD_SMALL_H2", "ULTRALYTICS_QUALITY_HEAD_SMALL_H2"], 0.09
+            ["ULTRALYTICS_DGLR_HEAD_SMALL_H2", "ULTRALYTICS_DLR_HEAD_SMALL_H2", "ULTRALYTICS_DLQ_HEAD_SMALL_H2", "ULTRALYTICS_QUALITY_HEAD_SMALL_H2"],
+            0.09,
         )
         self.drill_quality_small_w1 = _env_first_float(
-            ["ULTRALYTICS_DLQ_HEAD_DRILL_SMALL_W1", "ULTRALYTICS_QUALITY_HEAD_DRILL_SMALL_W1"], 1.3
+            [
+                "ULTRALYTICS_DGLR_HEAD_DRILL_SMALL_W1",
+                "ULTRALYTICS_DLR_HEAD_DRILL_SMALL_W1",
+                "ULTRALYTICS_DLQ_HEAD_DRILL_SMALL_W1",
+                "ULTRALYTICS_QUALITY_HEAD_DRILL_SMALL_W1",
+            ],
+            1.3,
         )
         self.drill_quality_small_w2 = _env_first_float(
-            ["ULTRALYTICS_DLQ_HEAD_DRILL_SMALL_W2", "ULTRALYTICS_QUALITY_HEAD_DRILL_SMALL_W2"], 1.15
+            [
+                "ULTRALYTICS_DGLR_HEAD_DRILL_SMALL_W2",
+                "ULTRALYTICS_DLR_HEAD_DRILL_SMALL_W2",
+                "ULTRALYTICS_DLQ_HEAD_DRILL_SMALL_W2",
+                "ULTRALYTICS_QUALITY_HEAD_DRILL_SMALL_W2",
+            ],
+            1.15,
         )
         self._reset_quality_stats()
         if self.quality_head_enable:
             head_name = (
-                "Drill-pipe Localization Quality Calibration Head (DLQ-Head)"
-                if self.quality_head_variant == "dlq"
-                else "IoU-aware quality head"
+                "Drill-pipe Glare-aware Localization Refinement Head (DGLR-Head)"
+                if self.quality_head_variant == "dglr"
+                else (
+                "Drill-pipe Localization Refinement Head (DLR-Head)"
+                if self.quality_head_variant == "dlr"
+                else ("Drill-pipe Localization Quality Calibration Head (DLQ-Head)" if self.quality_head_variant == "dlq" else "IoU-aware quality head")
+                )
             )
             LOGGER.info(
                 f"Using {head_name} "
