@@ -71,6 +71,7 @@ CONFLICT_ENV_KEYS = [
     "ULTRALYTICS_QUALITY_HEAD_LAMBDA",
     "ULTRALYTICS_QUALITY_HEAD_SCORE_MODE",
     "ULTRALYTICS_QUALITY_HEAD_ALPHA",
+    "ULTRALYTICS_QUALITY_HEAD_BASE_LEVEL",
     "ULTRALYTICS_QUALITY_HEAD_DRILL_WEIGHT_ENABLE",
     "ULTRALYTICS_QUALITY_HEAD_DRILL_WEIGHT_REFINE",
     "ULTRALYTICS_QUALITY_HEAD_TARGET_CLASS_IDS",
@@ -84,6 +85,7 @@ CONFLICT_ENV_KEYS = [
     "ULTRALYTICS_DLQ_HEAD_LAMBDA",
     "ULTRALYTICS_DLQ_HEAD_SCORE_MODE",
     "ULTRALYTICS_DLQ_HEAD_ALPHA",
+    "ULTRALYTICS_DLQ_HEAD_BASE_LEVEL",
     "ULTRALYTICS_DLQ_HEAD_DRILL_WEIGHT_ENABLE",
     "ULTRALYTICS_DLQ_HEAD_DRILL_WEIGHT_REFINE",
     "ULTRALYTICS_DLQ_HEAD_TARGET_CLASS_IDS",
@@ -124,6 +126,14 @@ def parse_args():
     parser.add_argument("--optimizer", default="SGD", help="Optimizer, e.g. SGD or AdamW.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--patience", type=int, default=100, help="Early stopping patience.")
+    parser.add_argument("--save-period", type=int, default=-1, help="Save checkpoint every x epochs (disabled if < 1).")
+    parser.add_argument("--cos-lr", type=str2bool, default=False, help="Use cosine learning rate schedule.")
+    parser.add_argument(
+        "--close-mosaic",
+        type=int,
+        default=10,
+        help="Disable mosaic augmentation in the last N epochs.",
+    )
     parser.add_argument("--inner-ratio", type=float, default=DEFAULT_INNER_RATIO, help="Inner-IoU box scaling ratio.")
     parser.add_argument(
         "--dlq-levels",
@@ -131,6 +141,12 @@ def parse_args():
         help="DLQ head levels: 'p3p4' (recommended) or 'all'.",
     )
     parser.add_argument("--dlq-lambda", type=float, default=0.20, help="Weight of the DLQ quality loss term.")
+    parser.add_argument(
+        "--dlq-base-level",
+        type=int,
+        default=3,
+        help="Pyramid base level used to parse dlq-levels for the current detect head.",
+    )
     parser.add_argument(
         "--dlq-score-mode",
         default="mul",
@@ -185,6 +201,7 @@ def configure_env(args) -> None:
     os.environ["ULTRALYTICS_DLQ_HEAD_LAMBDA"] = str(args.dlq_lambda)
     os.environ["ULTRALYTICS_DLQ_HEAD_SCORE_MODE"] = str(args.dlq_score_mode)
     os.environ["ULTRALYTICS_DLQ_HEAD_ALPHA"] = str(args.dlq_alpha)
+    os.environ["ULTRALYTICS_DLQ_HEAD_BASE_LEVEL"] = str(args.dlq_base_level)
     os.environ["ULTRALYTICS_DLQ_HEAD_DRILL_WEIGHT_ENABLE"] = "1" if args.use_drill_quality_weight else "0"
     os.environ["ULTRALYTICS_DLQ_HEAD_DRILL_WEIGHT_REFINE"] = "1" if args.drill_quality_refine else "0"
     os.environ["ULTRALYTICS_DLQ_HEAD_TARGET_CLASS_IDS"] = str(args.dlq_target_class_ids)
@@ -223,6 +240,7 @@ def main():
     print("dlq_lambda =", os.getenv("ULTRALYTICS_DLQ_HEAD_LAMBDA"))
     print("dlq_score_mode =", os.getenv("ULTRALYTICS_DLQ_HEAD_SCORE_MODE"))
     print("dlq_alpha =", os.getenv("ULTRALYTICS_DLQ_HEAD_ALPHA"))
+    print("dlq_base_level =", os.getenv("ULTRALYTICS_DLQ_HEAD_BASE_LEVEL"))
     print("use_drill_quality_weight =", os.getenv("ULTRALYTICS_DLQ_HEAD_DRILL_WEIGHT_ENABLE"))
     print("drill_quality_refine =", os.getenv("ULTRALYTICS_DLQ_HEAD_DRILL_WEIGHT_REFINE"))
     print("dlq_target_class_ids =", os.getenv("ULTRALYTICS_DLQ_HEAD_TARGET_CLASS_IDS"))
@@ -243,6 +261,9 @@ def main():
         "seed": args.seed,
         "deterministic": args.deterministic,
         "patience": args.patience,
+        "save_period": args.save_period,
+        "cos_lr": args.cos_lr,
+        "close_mosaic": args.close_mosaic,
         "cache": args.cache,
         "amp": args.amp,
         "save": True,

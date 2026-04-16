@@ -145,6 +145,7 @@ class BaseTrainer:
                 args_dict["augmentations"] = [repr(t) for t in args_dict["augmentations"]]
             YAML.save(self.save_dir / "args.yaml", args_dict)  # save run args
         self.last, self.best = self.wdir / "last.pt", self.wdir / "best.pt"  # checkpoint paths
+        self.best_map50 = self.wdir / "best_map50.pt"
         self.save_period = self.args.save_period
 
         self.batch_size = self.args.batch
@@ -170,7 +171,10 @@ class BaseTrainer:
 
         # Epoch level metrics
         self.best_fitness = None
+        self.best_map50_value = None
+        self.best_map50_epoch = -1
         self.fitness = None
+        self.map50 = None
         self.loss = None
         self.tloss = None
         self.loss_names = ["Loss"]
@@ -592,13 +596,15 @@ class BaseTrainer:
             {
                 "epoch": self.epoch,
                 "best_fitness": self.best_fitness,
+                "best_map50": self.best_map50_value,
+                "best_map50_epoch": self.best_map50_epoch,
                 "model": None,  # resume and final checkpoints derive from EMA
                 "ema": deepcopy(unwrap_model(self.ema.ema)).half(),
                 "updates": self.ema.updates,
                 "optimizer": convert_optimizer_state_dict_to_fp16(deepcopy(self.optimizer.state_dict())),
                 "scaler": self.scaler.state_dict(),
                 "train_args": vars(self.args),  # save as dict
-                "train_metrics": {**self.metrics, **{"fitness": self.fitness}},
+                "train_metrics": {**self.metrics, **{"fitness": self.fitness, "map50": self.map50}},
                 "train_results": self.read_results_csv(),
                 "date": datetime.now().isoformat(),
                 "version": __version__,
@@ -620,6 +626,8 @@ class BaseTrainer:
         self.last.write_bytes(serialized_ckpt)  # save last.pt
         if self.best_fitness == self.fitness:
             self.best.write_bytes(serialized_ckpt)  # save best.pt
+        if self.best_map50_epoch == self.epoch:
+            self.best_map50.write_bytes(serialized_ckpt)  # save best_map50.pt
         if (self.save_period > 0) and (self.epoch % self.save_period == 0):
             (self.wdir / f"epoch{self.epoch}.pt").write_bytes(serialized_ckpt)  # save epoch, i.e. 'epoch3.pt'
 
@@ -706,6 +714,10 @@ class BaseTrainer:
         if metrics is None:
             return None, None
         metrics = {**metrics, **self.model_metrics()}
+        self.map50 = metrics.get("metrics/mAP50(B)")
+        if self.map50 is not None and (self.best_map50_value is None or self.best_map50_value < self.map50):
+            self.best_map50_value = self.map50
+            self.best_map50_epoch = self.epoch
         fitness = metrics.pop("fitness", -self.loss.detach().cpu().numpy())  # use loss as fitness measure if not found
         if not self.best_fitness or self.best_fitness < fitness:
             self.best_fitness = fitness
@@ -858,6 +870,8 @@ class BaseTrainer:
             self.ema.ema.load_state_dict(ckpt["ema"].float().state_dict())
             self.ema.updates = ckpt["updates"]
         self.best_fitness = ckpt.get("best_fitness", 0.0)
+        self.best_map50_value = ckpt.get("best_map50", 0.0)
+        self.best_map50_epoch = ckpt.get("best_map50_epoch", -1)
 
     def _handle_nan_recovery(self, epoch):
         """Detect and recover from NaN/Inf loss and fitness collapse by loading last checkpoint."""

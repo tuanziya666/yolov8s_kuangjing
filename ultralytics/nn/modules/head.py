@@ -6,6 +6,7 @@ from __future__ import annotations
 import copy
 import math
 import os
+import re
 
 import torch
 import torch.nn as nn
@@ -52,29 +53,42 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-def _parse_quality_level_mask(levels: str, nl: int) -> list[bool]:
+def _env_int(name: str, default: int) -> int:
+    """Read an integer hyperparameter from the environment."""
+    try:
+        return int(os.getenv(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _default_quality_head_base_level(nl: int) -> int:
+    """Return the legacy base level used to parse P-level quality-head strings."""
+    return 3
+
+
+def _parse_quality_level_mask(levels: str, nl: int, base_level: int | None = None) -> list[bool]:
     """Parse the configured quality-head levels into a per-layer enable mask."""
     text = str(levels or "p3p4").strip().lower()
-    if text in {"all", "p3,p4,p5", "p3p4p5"}:
+    if base_level is None:
+        base_level = _default_quality_head_base_level(nl)
+
+    tokens = re.findall(r"p\d+|\d+|all", text.replace(";", ","))
+    if "all" in tokens:
         return [True] * nl
-    if text in {"p3p4", "p3,p4", "0,1"}:
-        return [i < min(2, nl) for i in range(nl)]
 
     indices = set()
-    for token in text.replace(";", ",").split(","):
-        token = token.strip().lower()
-        if not token:
-            continue
-        if token.startswith("p") and token[1:].isdigit():
-            idx = int(token[1:]) - 3
-        elif token.isdigit():
-            idx = int(token)
+    for token in tokens:
+        if token.startswith("p"):
+            idx = int(token[1:]) - int(base_level)
         else:
-            continue
+            idx = int(token)
         if 0 <= idx < nl:
             indices.add(idx)
+
     if not indices:
-        return [i < min(2, nl) for i in range(nl)]
+        indices = {level - int(base_level) for level in (3, 4) if 0 <= level - int(base_level) < nl}
+    if not indices:
+        indices = set(range(min(2, nl)))
     return [i in indices for i in range(nl)]
 
 
@@ -295,20 +309,30 @@ class Detect(nn.Module):
             levels_env = "ULTRALYTICS_DGLR_HEAD_LEVELS"
             score_env = "ULTRALYTICS_DGLR_HEAD_SCORE_MODE"
             alpha_env = "ULTRALYTICS_DGLR_HEAD_ALPHA"
+            base_level_env = "ULTRALYTICS_DGLR_HEAD_BASE_LEVEL"
         elif self.dlr_head_enable:
             levels_env = "ULTRALYTICS_DLR_HEAD_LEVELS"
             score_env = "ULTRALYTICS_DLR_HEAD_SCORE_MODE"
             alpha_env = "ULTRALYTICS_DLR_HEAD_ALPHA"
+            base_level_env = "ULTRALYTICS_DLR_HEAD_BASE_LEVEL"
         elif self.dlq_head_enable:
             levels_env = "ULTRALYTICS_DLQ_HEAD_LEVELS"
             score_env = "ULTRALYTICS_DLQ_HEAD_SCORE_MODE"
             alpha_env = "ULTRALYTICS_DLQ_HEAD_ALPHA"
+            base_level_env = "ULTRALYTICS_DLQ_HEAD_BASE_LEVEL"
         else:
             levels_env = "ULTRALYTICS_QUALITY_HEAD_LEVELS"
             score_env = "ULTRALYTICS_QUALITY_HEAD_SCORE_MODE"
             alpha_env = "ULTRALYTICS_QUALITY_HEAD_ALPHA"
+            base_level_env = "ULTRALYTICS_QUALITY_HEAD_BASE_LEVEL"
         self.quality_head_levels = os.getenv(levels_env, os.getenv("ULTRALYTICS_QUALITY_HEAD_LEVELS", default_levels))
-        self.quality_level_mask = _parse_quality_level_mask(self.quality_head_levels, self.nl)
+        self.quality_head_base_level = _env_int(
+            base_level_env,
+            _env_int("ULTRALYTICS_QUALITY_HEAD_BASE_LEVEL", _default_quality_head_base_level(self.nl)),
+        )
+        self.quality_level_mask = _parse_quality_level_mask(
+            self.quality_head_levels, self.nl, self.quality_head_base_level
+        )
         self.quality_score_mode = os.getenv(
             score_env,
             "mul"
@@ -471,6 +495,7 @@ class Detect(nn.Module):
         self.quality_head_variant = "none"
         self.quality_head_enable = False
         self.quality_head_levels = "p3p4"
+        self.quality_head_base_level = _default_quality_head_base_level(getattr(self, "nl", 0))
         self.quality_level_mask = [False] * getattr(self, "nl", 0)
         self.quality_score_mode = "sqrt"
         self.quality_alpha = 0.6

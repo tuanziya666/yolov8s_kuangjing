@@ -875,6 +875,7 @@ def plot_results(file: str = "path/to/results.csv", dir: str = "", on_plot: Call
     files = list(save_dir.glob("results*.csv"))
     assert len(files), f"No results.csv files found in {save_dir.resolve()}, nothing to plot."
 
+    fig, ax, columns = None, None, []
     loss_keys, metric_keys = [], []
     for i, f in enumerate(files):
         try:
@@ -889,7 +890,8 @@ def plot_results(file: str = "path/to/results.csv", dir: str = "", on_plot: Call
                 columns = (
                     loss_keys[:loss_mid] + metric_keys[:metric_mid] + loss_keys[loss_mid:] + metric_keys[metric_mid:]
                 )
-                fig, ax = plt.subplots(2, len(columns) // 2, figsize=(len(columns) + 2, 6), tight_layout=True)
+                n_cols = max(1, math.ceil(len(columns) / 2))
+                fig, ax = plt.subplots(2, n_cols, figsize=(max(len(columns), n_cols) + 2, 6), tight_layout=True)
                 ax = ax.ravel()
             x = data.select(data.columns[0]).to_numpy().flatten()
             for i, j in enumerate(columns):
@@ -899,7 +901,12 @@ def plot_results(file: str = "path/to/results.csv", dir: str = "", on_plot: Call
                 ax[i].set_title(j, fontsize=12)
         except Exception as e:
             LOGGER.error(f"Plotting error for {f}: {e}")
-    ax[1].legend()
+    if fig is None or ax is None:
+        return
+    for i in range(len(columns), len(ax)):
+        ax[i].axis("off")
+    legend_idx = 1 if len(ax) > 1 else 0
+    ax[legend_idx].legend()
     fname = save_dir / "results.png"
     fig.savefig(fname, dpi=200)
     plt.close()
