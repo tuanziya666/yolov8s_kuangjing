@@ -94,6 +94,12 @@ CONFLICT_ENV_KEYS = [
     "ULTRALYTICS_DLQ_HEAD_SMALL_H2",
     "ULTRALYTICS_DLQ_HEAD_DRILL_SMALL_W1",
     "ULTRALYTICS_DLQ_HEAD_DRILL_SMALL_W2",
+    "ULTRALYTICS_FOCUSED_TAL_ENABLE",
+    "ULTRALYTICS_FOCUSED_TAL_TOPK",
+    "ULTRALYTICS_FOCUSED_TAL_ALPHA",
+    "ULTRALYTICS_FOCUSED_TAL_BETA",
+    "ULTRALYTICS_FOCUSED_TAL_BOOST",
+    "ULTRALYTICS_FOCUSED_TAL_TARGET_CLASS_IDS",
 ]
 
 
@@ -181,6 +187,41 @@ def parse_args():
     parser.add_argument("--drill-quality-small-h2", type=float, default=0.09, help="Reserved secondary height threshold.")
     parser.add_argument("--drill-quality-small-w1", type=float, default=1.3, help="Weight for very small drill_pipe.")
     parser.add_argument("--drill-quality-small-w2", type=float, default=1.15, help="Reserved secondary drill weight.")
+    parser.add_argument(
+        "--focused-tal-enable",
+        type=str2bool,
+        default=False,
+        help="Enable focused Task-Aligned Assigner for target classes.",
+    )
+    parser.add_argument(
+        "--focused-tal-topk",
+        type=int,
+        default=20,
+        help="Top-k candidates used by focused TAL.",
+    )
+    parser.add_argument(
+        "--focused-tal-alpha",
+        type=float,
+        default=1.0,
+        help="Classification exponent in focused TAL alignment metric.",
+    )
+    parser.add_argument(
+        "--focused-tal-beta",
+        type=float,
+        default=3.0,
+        help="Localization exponent in focused TAL alignment metric.",
+    )
+    parser.add_argument(
+        "--focused-tal-boost",
+        type=float,
+        default=2.0,
+        help="Alignment boost applied to target classes in focused TAL.",
+    )
+    parser.add_argument(
+        "--focused-tal-target-class-ids",
+        default="2",
+        help="Comma-separated target class ids used by focused TAL boost.",
+    )
     parser.add_argument("--cache", type=str2bool, default=False, help="Whether to cache the dataset.")
     parser.add_argument("--amp", type=str2bool, default=True, help="Whether to use AMP training.")
     parser.add_argument("--deterministic", type=str2bool, default=True, help="Whether to use deterministic training.")
@@ -210,6 +251,12 @@ def configure_env(args) -> None:
     os.environ["ULTRALYTICS_DLQ_HEAD_SMALL_H2"] = str(args.drill_quality_small_h2)
     os.environ["ULTRALYTICS_DLQ_HEAD_DRILL_SMALL_W1"] = str(args.drill_quality_small_w1)
     os.environ["ULTRALYTICS_DLQ_HEAD_DRILL_SMALL_W2"] = str(args.drill_quality_small_w2)
+    os.environ["ULTRALYTICS_FOCUSED_TAL_ENABLE"] = "1" if args.focused_tal_enable else "0"
+    os.environ["ULTRALYTICS_FOCUSED_TAL_TOPK"] = str(args.focused_tal_topk)
+    os.environ["ULTRALYTICS_FOCUSED_TAL_ALPHA"] = str(args.focused_tal_alpha)
+    os.environ["ULTRALYTICS_FOCUSED_TAL_BETA"] = str(args.focused_tal_beta)
+    os.environ["ULTRALYTICS_FOCUSED_TAL_BOOST"] = str(args.focused_tal_boost)
+    os.environ["ULTRALYTICS_FOCUSED_TAL_TARGET_CLASS_IDS"] = str(args.focused_tal_target_class_ids)
 
     os.environ["ULTRALYTICS_SA_BOX_ENABLE"] = "0"
     os.environ["ULTRALYTICS_HARD_BOX_ENABLE"] = "0"
@@ -244,6 +291,12 @@ def main():
     print("use_drill_quality_weight =", os.getenv("ULTRALYTICS_DLQ_HEAD_DRILL_WEIGHT_ENABLE"))
     print("drill_quality_refine =", os.getenv("ULTRALYTICS_DLQ_HEAD_DRILL_WEIGHT_REFINE"))
     print("dlq_target_class_ids =", os.getenv("ULTRALYTICS_DLQ_HEAD_TARGET_CLASS_IDS"))
+    print("focused_tal_enable =", os.getenv("ULTRALYTICS_FOCUSED_TAL_ENABLE"))
+    print("focused_tal_topk =", os.getenv("ULTRALYTICS_FOCUSED_TAL_TOPK"))
+    print("focused_tal_alpha =", os.getenv("ULTRALYTICS_FOCUSED_TAL_ALPHA"))
+    print("focused_tal_beta =", os.getenv("ULTRALYTICS_FOCUSED_TAL_BETA"))
+    print("focused_tal_boost =", os.getenv("ULTRALYTICS_FOCUSED_TAL_BOOST"))
+    print("focused_tal_target_class_ids =", os.getenv("ULTRALYTICS_FOCUSED_TAL_TARGET_CLASS_IDS"))
     print("note = DLQ-Head refines P3/P4 features then predicts IoU-aware quality for cls*q score calibration")
 
     model = YOLO(args.model)

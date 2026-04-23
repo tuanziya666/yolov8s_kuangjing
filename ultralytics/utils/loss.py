@@ -12,7 +12,14 @@ import torch.nn.functional as F
 from ultralytics.utils import LOGGER
 from ultralytics.utils.metrics import OKS_SIGMA
 from ultralytics.utils.ops import crop_mask, xywh2xyxy, xyxy2xywh
-from ultralytics.utils.tal import RotatedTaskAlignedAssigner, TaskAlignedAssigner, dist2bbox, dist2rbox, make_anchors
+from ultralytics.utils.tal import (
+    FocusedTaskAlignedAssigner,
+    RotatedTaskAlignedAssigner,
+    TaskAlignedAssigner,
+    dist2bbox,
+    dist2rbox,
+    make_anchors,
+)
 from ultralytics.utils.torch_utils import autocast
 
 from .metrics import bbox_ciou_components, bbox_iou, probiou
@@ -56,6 +63,14 @@ def _env_int_list(name: str, default: list[int]) -> list[int]:
         except ValueError:
             continue
     return out or list(default)
+
+
+def _env_int(name: str, default: int) -> int:
+    """Read an integer hyperparameter from the environment."""
+    try:
+        return int(float(os.getenv(name, default)))
+    except (TypeError, ValueError):
+        return default
 
 
 def _env_first_str(names: list[str], default: str) -> str:
@@ -899,7 +914,24 @@ class v8DetectionLoss:
 
         self.use_dfl = m.reg_max > 1
 
-        self.assigner = TaskAlignedAssigner(topk=tal_topk, num_classes=self.nc, alpha=0.5, beta=6.0)
+        self.focused_tal_enable = _env_bool("ULTRALYTICS_FOCUSED_TAL_ENABLE", False)
+        self.focused_tal_topk = max(1, _env_int("ULTRALYTICS_FOCUSED_TAL_TOPK", tal_topk))
+        self.focused_tal_alpha = _env_float("ULTRALYTICS_FOCUSED_TAL_ALPHA", 0.5)
+        self.focused_tal_beta = _env_float("ULTRALYTICS_FOCUSED_TAL_BETA", 6.0)
+        self.focused_tal_boost = _env_float("ULTRALYTICS_FOCUSED_TAL_BOOST", 1.0)
+        self.focused_tal_target_class_ids = _env_int_list("ULTRALYTICS_FOCUSED_TAL_TARGET_CLASS_IDS", [2])
+
+        if self.focused_tal_enable:
+            self.assigner = FocusedTaskAlignedAssigner(
+                topk=self.focused_tal_topk,
+                num_classes=self.nc,
+                alpha=self.focused_tal_alpha,
+                beta=self.focused_tal_beta,
+                focused_target_class_ids=self.focused_tal_target_class_ids,
+                focused_boost=self.focused_tal_boost,
+            )
+        else:
+            self.assigner = TaskAlignedAssigner(topk=tal_topk, num_classes=self.nc, alpha=0.5, beta=6.0)
         self.bbox_loss = BboxLoss(m.reg_max, h).to(device)
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
         self.conf_eps = self.bbox_loss.conf_eps
@@ -922,6 +954,13 @@ class v8DetectionLoss:
             )
         elif self.bbox_loss.iou_type == "mpdiou":
             LOGGER.info("Using MPDIoU for box regression (minimum point distance IoU).")
+        if self.focused_tal_enable:
+            LOGGER.info(
+                "Using focused Task-Aligned Assigner "
+                f"(topk={self.focused_tal_topk}, alpha={self.focused_tal_alpha:.3f}, "
+                f"beta={self.focused_tal_beta:.3f}, boost={self.focused_tal_boost:.3f}, "
+                f"target_cls={self.focused_tal_target_class_ids})."
+            )
         if self.bbox_loss.tal_reg_enable:
             LOGGER.info(
                 "Using late-stage TAL regression reweighting "
