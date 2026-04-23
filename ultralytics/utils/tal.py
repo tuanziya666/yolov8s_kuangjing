@@ -315,6 +315,49 @@ class TaskAlignedAssigner(nn.Module):
         return target_gt_idx, fg_mask, mask_pos
 
 
+class FocusedTaskAlignedAssigner(TaskAlignedAssigner):
+    """TaskAlignedAssigner with an extra alignment boost for target classes."""
+
+    def __init__(
+        self,
+        *args,
+        focused_target_class_ids: list[int] | tuple[int, ...] | None = None,
+        focused_boost: float = 1.0,
+        **kwargs,
+    ):
+        """Initialize a focused TAL assigner.
+
+        Args:
+            focused_target_class_ids (list[int] | tuple[int, ...] | None): Target class IDs that receive alignment boost.
+            focused_boost (float): Multiplicative boost applied to alignment metric for target classes.
+        """
+        super().__init__(*args, **kwargs)
+        self.focused_target_class_ids = tuple(int(x) for x in (focused_target_class_ids or []))
+        self.focused_boost = float(focused_boost)
+
+    def get_box_metrics(self, pd_scores, pd_bboxes, gt_labels, gt_bboxes, mask_gt):
+        """Compute alignment metrics with optional target-class boosting."""
+        align_metric, overlaps = super().get_box_metrics(pd_scores, pd_bboxes, gt_labels, gt_bboxes, mask_gt)
+
+        if self.focused_boost == 1.0 or not self.focused_target_class_ids:
+            return align_metric, overlaps
+
+        gt_label_ids = gt_labels.squeeze(-1).long()
+        focus_mask = torch.zeros_like(gt_label_ids, dtype=torch.bool)
+        for class_id in self.focused_target_class_ids:
+            focus_mask |= gt_label_ids.eq(class_id)
+
+        if focus_mask.any():
+            boost = torch.where(
+                focus_mask.unsqueeze(-1),
+                torch.full_like(align_metric, self.focused_boost),
+                torch.ones_like(align_metric),
+            )
+            align_metric = align_metric * boost
+
+        return align_metric, overlaps
+
+
 class RotatedTaskAlignedAssigner(TaskAlignedAssigner):
     """Assigns ground-truth objects to rotated bounding boxes using a task-aligned metric."""
 
